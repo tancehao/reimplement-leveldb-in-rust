@@ -1,13 +1,14 @@
 use crate::batch::Batch;
 use crate::compare::Comparator;
-use crate::filename::{db_filename, parse_dbname, FileType};
+use crate::filename::{db_filename, parse_dbname, set_current_file, FileType};
 use crate::io::{Encoding, Storage, StorageSystem};
 use crate::key::{InternalKey, InternalKeyComparator, InternalKeyRef};
 use crate::memtable::MemTable;
 use crate::opts::Opts;
-use crate::version::{VersionSet, LEVELS};
+use crate::utils::call_on_drop::CallOnDrop;
+use crate::version::{VersionEdit, VersionSet, LEVELS};
 use crate::wal::{WalReader, WalWriter};
-use crate::{LError, L0_SLOWDOWN_WRITES_TRIGGER, L0_STOP_WRITES_TRIGGER};
+use crate::{call_on_drop, unregister, LError, L0_SLOWDOWN_WRITES_TRIGGER, L0_STOP_WRITES_TRIGGER};
 use bytes::{Bytes, BytesMut};
 use crossbeam::channel::{unbounded, Receiver, Sender};
 use std::cmp::{max, Ordering};
@@ -17,12 +18,14 @@ use std::path::Path;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
-pub struct DB<C: Comparator, O: Storage, S: StorageSystem<O = O>, M: MemTable> {
+pub struct DB<C: Comparator, S: Storage, M: MemTable> {
     pub(crate) dirname: String,
     pub(crate) opts: Opts<C>,
     pub(crate) ucmp: C,
     pub(crate) icmp: InternalKeyComparator<C>,
-    pub(crate) inner: Arc<Mutex<DBInner<C, O, S, M>>>,
+    pub(crate) inner: Arc<Mutex<DBInner<C, S, M>>>,
+    #[allow(unused)]
+    pub(crate) file_lock: Arc<Mutex<Box<dyn Send>>>,
     pub(crate) compactioning: Arc<RwLock<()>>,
     pub(crate) bgwork_trigger: Sender<BGWorkTask>,
 }
@@ -34,7 +37,7 @@ pub(crate) enum BGWorkTask {
     CleanWAL(u64),
 }
 
-impl<C: Comparator, O: Storage, S: StorageSystem<O = O>, M: MemTable> Clone for DB<C, O, S, M> {
+impl<C: Comparator, S: Storage, M: MemTable> Clone for DB<C, S, M> {
     fn clone(&self) -> Self {
         Self {
             dirname: self.dirname.clone(),
@@ -42,6 +45,7 @@ impl<C: Comparator, O: Storage, S: StorageSystem<O = O>, M: MemTable> Clone for 
             ucmp: self.ucmp.clone(),
             icmp: self.icmp.clone(),
             inner: self.inner.clone(),
+            file_lock: Arc::new(Mutex::new(Box::new(vec![0]))),
             compactioning: self.compactioning.clone(),
             bgwork_trigger: self.bgwork_trigger.clone(),
         }
@@ -67,20 +71,26 @@ impl<M: MemTable, S: Storage> MemDB<M, S> {
     }
 }
 
-pub(crate) struct DBInner<C: Comparator, O: Storage, S: StorageSystem<O = O>, M: MemTable> {
-    pub(crate) versions: VersionSet<C, O, S>,
-    pub(crate) memdb: MemDB<M, O>,
-    pub(crate) imem: Option<Arc<MemDB<M, O>>>,
+pub(crate) struct DBInner<C: Comparator, S: Storage, M: MemTable> {
+    pub(crate) versions: VersionSet<C, S>,
+    pub(crate) memdb: MemDB<M, S>,
+    pub(crate) imem: Option<Arc<MemDB<M, S>>>,
     pub(crate) pending_outputs: HashSet<u64>,
 }
 
-impl<C: Comparator, O: Storage, S: StorageSystem<O = O>, M: MemTable> DB<C, O, S, M> {
-    pub fn open(dirname: String, opts: Opts<C>, fs: S) -> Result<Self, LError> {
+impl<C: Comparator, S: Storage, M: MemTable> DB<C, S, M> {
+    pub fn open(
+        dirname: String,
+        opts: Opts<C>,
+        fs: &'static dyn StorageSystem<O = S>,
+    ) -> Result<Self, LError> {
         let dirname = if dirname.starts_with("/") {
             dirname
         } else {
             format!("{}/{}", fs.pwd()?, dirname)
         };
+        fs.mkdir_all(dirname.as_str())?;
+        let file_lock = fs.lock(db_filename(dirname.as_str(), FileType::Lock).as_str())?;
         let (bgwork_tx, bgwork_rx) = unbounded();
         let db = Self {
             dirname: dirname.clone(),
@@ -102,6 +112,7 @@ impl<C: Comparator, O: Storage, S: StorageSystem<O = O>, M: MemTable> DB<C, O, S
                 imem: None,
                 pending_outputs: Default::default(),
             })),
+            file_lock: Arc::new(Mutex::new(file_lock)),
             bgwork_trigger: bgwork_tx.clone(),
         };
 
@@ -109,17 +120,18 @@ impl<C: Comparator, O: Storage, S: StorageSystem<O = O>, M: MemTable> DB<C, O, S
         inner.versions =
             VersionSet::new(dirname.clone(), bgwork_tx.clone(), opts.clone(), fs.clone());
 
-        // TODO: need to acquire a file lock
-        if fs.exists(dirname.as_str())? {
+        let current_name = db_filename(dirname.as_str(), FileType::Current);
+
+        if !fs.exists(current_name.as_str())? {
+            inner.versions.create_new()?;
+        } else {
             if opts.get_error_if_db_exists() {
                 return Err(LError::Internal(format!(
                     "the db {} already exists",
                     dirname
                 )));
             }
-            inner.versions.load()?;
-        } else {
-            inner.versions.create_new()?;
+            inner.versions.load(opts.clone())?;
         }
 
         let file_names = fs.list(dirname.as_str())?;
@@ -156,7 +168,7 @@ impl<C: Comparator, O: Storage, S: StorageSystem<O = O>, M: MemTable> DB<C, O, S
         Ok(db)
     }
 
-    fn replay_wal(&self, mut reader: WalReader<O>, opts: &Opts<C>) -> Result<u64, LError> {
+    fn replay_wal(&self, mut reader: WalReader<S>, opts: &Opts<C>) -> Result<u64, LError> {
         let mut inner = self.inner.lock()?;
         let mut max_seq_num = 0;
         while let Some(log) = reader.next()? {
@@ -176,7 +188,7 @@ impl<C: Comparator, O: Storage, S: StorageSystem<O = O>, M: MemTable> DB<C, O, S
     }
 
     fn start_bgwork(&self, rx: Receiver<BGWorkTask>) {
-        let handler = |db: &DB<C, O, S, M>, t: BGWorkTask| -> Result<(), LError> {
+        let handler = |db: &DB<C, S, M>, t: BGWorkTask| -> Result<(), LError> {
             match t {
                 BGWorkTask::Compaction => {
                     db.compact()?;
@@ -265,10 +277,65 @@ impl<C: Comparator, O: Storage, S: StorageSystem<O = O>, M: MemTable> DB<C, O, S
         }
         Ok(())
     }
+
+    pub(crate) fn apply_version_edit(&self, ve: &mut VersionEdit<S>) -> Result<(), LError> {
+        let inner = self.inner.lock()?;
+
+        if ve.log_number != 0 {
+            if ve.log_number < inner.versions.log_number
+                || ve.log_number >= inner.versions.next_file_number
+            {
+                panic!("inconsistent VersionEdit log_number: {}", ve.log_number);
+            }
+        }
+        if ve.log_number == 0 {
+            ve.log_number = inner.versions.log_number;
+        }
+        ve.next_file_number = inner.versions.next_file_number;
+        ve.last_sequence = inner.versions.last_sequence;
+        let new_version = inner.versions.current_version().edit(ve);
+        let manifest_number = inner.versions.manifest_file_number;
+        let fs = inner.versions.fs.clone();
+        let manifest_file = inner.versions.manifest_file.clone();
+        let snapshot = inner.versions.make_snapshot();
+
+        let mut mfile = manifest_file.lock()?;
+        // we're going to write logs to the manifest file, release the lock now.
+        drop(inner);
+
+        let mut tmpfile_recycler = None;
+        if mfile.is_none() {
+            let filename = db_filename(self.dirname.as_str(), FileType::Manifest(manifest_number));
+            let file = fs.create(filename.as_str())?;
+            let fs_c = fs.clone();
+            tmpfile_recycler = Some(call_on_drop!({
+                let _ = fs_c.remove(filename.as_str());
+            }));
+            let mut ww = WalWriter::new(file);
+            let mut log = BytesMut::new();
+            snapshot.encode(&mut log, &self.opts);
+            ww.append(log.as_ref())?;
+            *mfile = Some(ww);
+        }
+        let ww = mfile.as_mut().unwrap();
+        let mut log = BytesMut::new();
+        ve.encode(&mut log, &self.opts);
+        ww.append(log.as_ref())?;
+        ww.flush()?;
+        set_current_file(fs, self.dirname.as_str(), manifest_number)?;
+        drop(mfile);
+        let mut inner = self.inner.lock()?;
+        inner.versions.set_version(Arc::new(new_version));
+        if ve.log_number != 0 {
+            inner.versions.log_number = ve.log_number;
+        }
+        tmpfile_recycler.map(|mut x| unregister!(x));
+        Ok(())
+    }
 }
 
 // exported methods
-impl<C: Comparator, O: Storage, S: StorageSystem<O = O>, M: MemTable> DB<C, O, S, M> {
+impl<C: Comparator, O: Storage, M: MemTable> DB<C, O, M> {
     pub fn get(&self, key: &[u8]) -> Result<Option<Bytes>, LError> {
         let (ikey, version) = {
             let l = self.inner.lock()?;
@@ -369,23 +436,23 @@ impl<C: Comparator, O: Storage, S: StorageSystem<O = O>, M: MemTable> DB<C, O, S
     }
 
     #[allow(unused)]
-    pub fn snapshot(&self) -> Result<Snapshot<C, O, S, M>, LError> {
-        Err(LError::Internal(format!("unimplemented")))
+    pub fn snapshot(&self) -> Result<Snapshot<C, O, M>, LError> {
+        Err(LError::Internal("unimplemented".into()))
     }
 
     #[allow(unused)]
     pub fn compact_manually(&self) -> Result<(), LError> {
-        Err(LError::Internal(format!("unimplemented")))
+        Err(LError::Internal("unimplemented".into()))
     }
 
     #[allow(unused)]
     pub fn dump<D: AsRef<Path>>(&self, target_dir: D) -> Result<(), LError> {
-        Err(LError::Internal(format!("unimplemented")))
+        Err(LError::Internal("unimplemented".into()))
     }
 
     #[allow(unused)]
     pub fn watch_event(&self, event_type: EventType) -> Result<(), LError> {
-        Err(LError::Internal(format!("unimplemented")))
+        Err(LError::Internal("unimplemented".into()))
     }
 }
 
@@ -402,9 +469,9 @@ pub enum EventType {
 }
 
 #[allow(unused)]
-pub struct Snapshot<C: Comparator, O: Storage, S: StorageSystem<O = O>, M: MemTable> {
+pub struct Snapshot<C: Comparator, O: Storage, M: MemTable> {
     seq_num: u64,
-    db: DB<C, O, S, M>,
+    db: DB<C, O, M>,
 }
 
 pub trait DBScanner {

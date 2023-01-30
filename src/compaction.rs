@@ -1,15 +1,14 @@
 use crate::compare::Comparator;
 use crate::db::{BGWorkTask, ConcatScanner, DBScanner, MergeScanner, DB};
 use crate::filename::{db_filename, FileType};
-use crate::io::{Storage, StorageSystem};
+use crate::io::Storage;
 use crate::key::{InternalKey, InternalKeyComparator, InternalKeyKind, InternalKeyRef};
 use crate::memtable::MemTable;
 use crate::sstable::reader::SSTableScanner;
 use crate::sstable::writer::SSTableWriter;
+use crate::utils::call_on_drop::CallOnDrop;
 use crate::version::{ikey_range, DataFile, DataFilePtr, VersionEdit, VersionPtr, LEVELS};
-
-use crate::LError;
-
+use crate::{call_on_drop, unregister, LError};
 use std::cmp::Ordering;
 
 use bytes::Bytes;
@@ -128,7 +127,7 @@ impl<S: Storage> Compaction<S> {
     }
 }
 
-impl<C: Comparator, O: Storage, S: StorageSystem<O = O>, M: MemTable> DB<C, O, S, M> {
+impl<C: Comparator, O: Storage, M: MemTable> DB<C, O, M> {
     pub(crate) fn maybe_schedule_compaction(&self) {
         if self.bgwork_trigger.send(BGWorkTask::Compaction).is_err() {
             panic!("bg work thread is broken")
@@ -146,7 +145,7 @@ impl<C: Comparator, O: Storage, S: StorageSystem<O = O>, M: MemTable> DB<C, O, S
     fn compact1(&self) -> Result<bool, LError> {
         let l = self.compactioning.clone();
         let _g = l.write()?;
-        let mut inner = self.inner.lock()?;
+        let inner = self.inner.lock()?;
         if let Some(imem) = inner.imem.as_ref() {
             let imem = imem.clone();
             // when a memdb is full, we convert it to imem and give it a new empty one with a newly created WAL.
@@ -156,6 +155,7 @@ impl<C: Comparator, O: Storage, S: StorageSystem<O = O>, M: MemTable> DB<C, O, S
             let current_log_number = inner.versions.log_number;
             // the log number of the WAL who's associated memtable is going to be compacted.
             let compacted_log_num = imem.wal_log_num();
+            // no need to hold the lock on inner when compacting imem table
             drop(inner);
             self.compact_imem_table(imem.as_ref(), current_log_number)?;
             // now we have succeed in compacting the imem table to a file.
@@ -182,6 +182,11 @@ impl<C: Comparator, O: Storage, S: StorageSystem<O = O>, M: MemTable> DB<C, O, S
             None => return Ok(false),
         };
         let total_size = compaction.inputs[2].iter().map(|x| x.size).sum::<u64>();
+        // We can simply move the sstable to the next level, since there are no sstables in that level.
+        // But we don't do this if the total size of the file in the 'grandparent' level is too large,
+        // because this may lead to a very heavy compaction later. Instead we do compaction in the base
+        // file hoping to decrease the size of the generated file as most as we can by remove those
+        // deleted keys.
         if compaction.inputs[0].len() == 1
             && compaction.inputs[1].len() == 0
             && total_size < MAX_GRANDPARENT_OVERLAP_BYTES
@@ -189,18 +194,16 @@ impl<C: Comparator, O: Storage, S: StorageSystem<O = O>, M: MemTable> DB<C, O, S
             let mut ve = VersionEdit::empty();
             ve.delete_file(compaction.level, compaction.inputs[0][0].num);
             ve.new_file(compaction.level + 1, compaction.inputs[0][0].clone());
-            inner
-                .versions
-                .log_and_apply(self.dirname.as_str(), &mut ve)?;
+            drop(inner);
+            self.apply_version_edit(&mut ve)?;
             return Ok(false);
         }
         drop(inner);
-        let _r = self.compact_disk_tables(compaction);
+        self.compact_disk_tables(compaction)?;
         Ok(false)
     }
 
-    // TODO: need to remove the newly created file if error occurs in later use.
-    fn new_sstable_file(&self) -> Result<(u64, SSTableWriter<C, O>), LError> {
+    fn new_sstable_file(&self) -> Result<(u64, SSTableWriter<C, O>, CallOnDrop), LError> {
         let (file_num, file_name, fs) = {
             let mut inner = self.inner.lock()?;
             let file_num = inner.versions.incr_file_number();
@@ -209,12 +212,15 @@ impl<C: Comparator, O: Storage, S: StorageSystem<O = O>, M: MemTable> DB<C, O, S
             (file_num, file_name, inner.versions.fs.clone())
         };
         let file = fs.create(file_name.as_str())?;
+        let tmpfile_recycler = call_on_drop!({
+            let _ = fs.remove(file_name.as_str());
+        });
         let writer = SSTableWriter::new(file_num, file, self.opts.clone());
-        Ok((file_num, writer))
+        Ok((file_num, writer, tmpfile_recycler))
     }
 
     pub(crate) fn compact_imem_table(&self, imem: &M, log_num: u64) -> Result<(), LError> {
-        let (file_num, mut new_table) = self.new_sstable_file()?;
+        let (file_num, mut new_table, mut tmpfile_recycler) = self.new_sstable_file()?;
         let mut scanner = imem.iter(self.ucmp);
         let mut smallest: Option<InternalKey> = None;
         let mut largest: Option<InternalKey> = None;
@@ -234,7 +240,7 @@ impl<C: Comparator, O: Storage, S: StorageSystem<O = O>, M: MemTable> DB<C, O, S
             new_table.set(&internal_key, v)?;
         }
         if smallest.is_none() || largest.is_none() {
-            return Err(LError::Internal(format!("compacting imem when it's empty")));
+            return Err(LError::Internal("compacting an empty imem".into()));
         }
 
         new_table.finish()?;
@@ -254,11 +260,9 @@ impl<C: Comparator, O: Storage, S: StorageSystem<O = O>, M: MemTable> DB<C, O, S
             }),
         );
         ve.set_log_number(log_num);
-        let mut inner = self.inner.lock()?;
-        inner
-            .versions
-            .log_and_apply(self.dirname.as_str(), &mut ve)?;
-        inner.pending_outputs.remove(&file_num);
+        self.apply_version_edit(&mut ve)?;
+        unregister!(tmpfile_recycler);
+        self.inner.lock()?.pending_outputs.remove(&file_num);
         Ok(())
     }
 
@@ -287,6 +291,7 @@ impl<C: Comparator, O: Storage, S: StorageSystem<O = O>, M: MemTable> DB<C, O, S
         let mut prev_key: Option<InternalKey> = None;
         let mut new_table: Option<(u64, SSTableWriter<C, O>)> = None;
         let mut new_files = vec![];
+        let mut tmpfile_recyclers = vec![];
         while let Some((ik, v)) = scanner.next()? {
             if let Some(prev_k) = prev_key.as_ref() {
                 if self.ucmp.compare(prev_k.ukey(), ik.ukey()) == Ordering::Equal {
@@ -297,13 +302,15 @@ impl<C: Comparator, O: Storage, S: StorageSystem<O = O>, M: MemTable> DB<C, O, S
             }
             smallest = smallest.or(Some(ik.clone()));
             prev_key = Some(ik.clone());
+            // no need to keep the deleted key because there are no older versions of SET operation.
             if ik.kind() == InternalKeyKind::Delete
                 && c.is_base_level_for_ukey(self.ucmp, ik.ukey())
             {
                 continue;
             }
             if new_table.is_none() {
-                let (file_num, table) = self.new_sstable_file()?;
+                let (file_num, table, tmpfile_recycler) = self.new_sstable_file()?;
+                tmpfile_recyclers.push(tmpfile_recycler);
                 new_table = Some((file_num, table));
             }
             let t = new_table.as_mut().map(|(_, x)| x).unwrap();
@@ -352,12 +359,15 @@ impl<C: Comparator, O: Storage, S: StorageSystem<O = O>, M: MemTable> DB<C, O, S
                 .iter()
                 .for_each(|x| ve.delete_file(i + c.level, x.num));
         }
+        self.apply_version_edit(&mut ve)?;
+
         let mut inner = self.inner.lock()?;
         new_file_nums.iter().for_each(|x| {
             inner.pending_outputs.remove(x);
         });
-        let r = inner.versions.log_and_apply(self.dirname.as_str(), &mut ve);
-        r
+
+        tmpfile_recyclers.iter_mut().for_each(|x| unregister!(x));
+        Ok(())
     }
 }
 
@@ -365,7 +375,7 @@ impl<C: Comparator, O: Storage, S: StorageSystem<O = O>, M: MemTable> DB<C, O, S
 mod test {
     use crate::compare::BytewiseComparator;
     use crate::db::{DBScanner, DB};
-    use crate::io::{MemFS, Storage, StorageSystem};
+    use crate::io::{MemFS, MemFile, Storage, StorageSystem, MEM_FS};
     use crate::key::InternalKeyRef;
     use crate::memtable::simple::BTMap;
     use crate::memtable::MemTable;
@@ -378,8 +388,8 @@ mod test {
     fn test_compact_imem() {
         let opt_raw: OptsRaw<BytewiseComparator> = OptsRaw::default();
         let opts = Arc::new(opt_raw);
-        let fs = MemFS::default();
-        let db = DB::open("db_dir".to_string(), opts.clone(), fs.clone()).unwrap();
+        let fs = &*MEM_FS as &'static dyn StorageSystem<O = MemFile>;
+        let db = DB::open("db_dir".to_string(), opts.clone(), fs).unwrap();
         let mut mem = BTMap::default();
         let mut kvs = HashMap::new();
         for i in 0..10000 {

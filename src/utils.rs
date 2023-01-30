@@ -2,6 +2,7 @@ use std::ops::{Deref, DerefMut};
 use std::sync::PoisonError;
 
 pub mod any;
+pub mod call_on_drop;
 pub mod crc;
 pub mod varint;
 

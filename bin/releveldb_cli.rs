@@ -2,21 +2,21 @@ use bytes::Bytes;
 use crossbeam::channel::Sender;
 use releveldb::compare::BytewiseComparator;
 use releveldb::db::{DBScanner, DB};
-use releveldb::io::{OsFS, StorageSystem};
+use releveldb::io::{OsFS, StorageSystem, OS_FS};
 use releveldb::memtable::simple::BTMap;
 use releveldb::opts::{empty_compact_hook, Opts, OptsRaw};
 use releveldb::sstable::reader::SSTableReader;
 use releveldb::sstable::reader::SSTableScanner;
 use releveldb::utils::any::Any;
 use std::fs::File;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::sync::Arc;
 
 fn interactive() {
     let opts = get_opts(Any::new(()));
     let dirname = format!("{}/data", OsFS::default().pwd().unwrap());
-    let db: DB<BytewiseComparator, File, OsFS, BTMap> =
-        DB::open(dirname.clone(), opts.clone(), OsFS::default()).unwrap();
+    let db: DB<BytewiseComparator, File, BTMap> =
+        DB::open(dirname.clone(), opts.clone(), &OS_FS).unwrap();
     let mut cmd = String::new();
     loop {
         cmd.clear();
@@ -113,6 +113,13 @@ fn main() {
             None => return println!("file number should be specified"),
             Some(n) => learn_file(n.as_str()),
         },
+        "load" => {
+            let filename = match args.get(2) {
+                None => "test.data".to_string(),
+                Some(v) => v.clone(),
+            };
+            load(filename);
+        }
         _ => unimplemented!(),
     }
     return;
@@ -135,5 +142,56 @@ fn learn_file(name: &str) {
             Ok(None) => break,
             Ok(Some((k, v))) => println!("{}: {:?}", k, v),
         }
+    }
+}
+
+fn load(filename: String) {
+    let opts = get_opts(Any::new(()));
+    let dirname = format!("{}/data", OsFS::default().pwd().unwrap());
+    let db: DB<BytewiseComparator, File, BTMap> =
+        DB::open(dirname.clone(), opts.clone(), &OS_FS).unwrap();
+    let mut f = File::open(filename).expect("file not found");
+    let mut buf = String::new();
+    f.read_to_string(&mut buf).expect("failed to read file");
+    let mut cmds = vec![];
+    for (i, line) in buf.split("\n").enumerate() {
+        let params = line
+            .split(" ")
+            .map(|x| x.to_string())
+            .collect::<Vec<String>>();
+        match params.len() {
+            0 => continue,
+            1 => cmds.push((params[0].clone(), None)),
+            2 => cmds.push((params[0].clone(), Some(params[1].clone()))),
+            _ => println!("too many arguments at line {}", i),
+        }
+    }
+
+    let mut cmd_groups = vec![vec![], vec![], vec![], vec![]];
+    let mut i = 0;
+    for cmd in cmds.into_iter() {
+        cmd_groups[i % 4].push(cmd);
+        i += 1;
+    }
+    let mut threads = vec![];
+    for _ in 0..4 {
+        let db_c = db.clone();
+        let cmds = cmd_groups.pop().unwrap();
+        let j = std::thread::spawn(move || {
+            for (k, v) in cmds {
+                let r = match v {
+                    None => db_c.del(k.into()),
+                    Some(val) => db_c.set(k.into(), val.into()),
+                };
+                if let Err(e) = r {
+                    println!("failed to write to db: {:?}", e);
+                    break;
+                }
+            }
+        });
+        threads.push(j);
+    }
+    for t in threads {
+        t.join().unwrap();
     }
 }

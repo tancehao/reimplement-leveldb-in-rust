@@ -53,7 +53,7 @@ impl Encoding for BlockHandle {
         }
         Err(LError::InvalidFile(format!(
             "invalid blockhandle: {:?}",
-            src
+            buf
         )))
     }
 }
@@ -85,12 +85,12 @@ impl Encoding for Footer {
 
     fn decode<C: Comparator>(src: &mut Bytes, opts: &Opts<C>) -> Result<Self, LError> {
         if src.len() != FOOTER_SIZE {
-            return Err(LError::InvalidFile(format!(
-                "invalid footer: the size should be 48 bytes"
-            )));
+            return Err(LError::InvalidFile(
+                "invalid footer: the size should be 48 bytes".into(),
+            ));
         }
         if src[FOOTER_SIZE - 8..].as_ref() != MAGIC_NUMBER.to_le_bytes() {
-            return Err(LError::InvalidFile(format!("invalid magic number")));
+            return Err(LError::InvalidFile("invalid magic number".into()));
         }
         let _ = src.split_off(FOOTER_SIZE - 8);
         let metaindex_handle = BlockHandle::decode(src, opts)?;
@@ -121,13 +121,13 @@ pub(crate) fn read_filter_data<C: Comparator, S: Storage>(
                     let bh = entry_group.get_nth_value(i).unwrap();
                     let filter_block = read_block_data(file, bh)?;
                     let filter = Filter::from_sstable_block(filter_block, v, opt)
-                        .ok_or(LError::InvalidFile(format!("unable to decode filter")))?;
+                        .ok_or(LError::InvalidFile("unable to decode filter".into()))?;
                     return Ok(Some(filter));
                 }
             }
         }
     }
-    Err(LError::InvalidFile(format!("unavailable filter found")))
+    Err(LError::InvalidFile("unavailable filter found".into()))
 }
 
 pub(crate) fn read_block_data<S: Storage>(
@@ -170,7 +170,7 @@ impl Encoding for FilterBlock {
 
     fn decode<C: Comparator>(src: &mut Bytes, opts: &Opts<C>) -> Result<Self, LError> {
         if src.len() < 5 {
-            Err(LError::InvalidFile(format!("invalid filter block")))
+            Err(LError::InvalidFile("invalid filter block".into()))
         } else {
             Ok(FilterBlock::from(split_block_tracer(src, opts)?))
         }
@@ -237,9 +237,9 @@ impl<T: Encoding + Clone> Encoding for DecodedBlock<T> {
                 .unwrap(),
         ) as usize;
         if num_restarts == 0 {
-            return Err(LError::InvalidFile(format!(
-                "invalid table for no restart points"
-            )));
+            return Err(LError::InvalidFile(
+                "invalid table for no restart points".into(),
+            ));
         }
         let mut restarts_data = block_data.split_off(block_data.len() - num_restarts * 4);
         let data_len = block_data.len();
@@ -268,17 +268,17 @@ impl<T: Encoding + Clone> Encoding for DecodedBlock<T> {
 fn split_block_tracer<C: Comparator>(src: &mut Bytes, opts: &Opts<C>) -> Result<Bytes, LError> {
     let len = src.len();
     if len < 5 {
-        return Err(LError::InvalidFile(format!(
-            "invalid block for too short length"
-        )));
+        return Err(LError::InvalidFile(
+            "invalid block for too short length".into(),
+        ));
     }
     if opts.verify_checksum {
         let expected_checksum = u32::from_le_bytes(src[len - 4..].as_ref().try_into().unwrap());
         let actual_checksum = crc32(src[..len - 5].as_ref());
         if expected_checksum != actual_checksum {
-            return Err(LError::InvalidFile(format!(
-                "invalid block for checksum mismatch"
-            )));
+            return Err(LError::InvalidFile(
+                "invalid block for checksum mismatch".into(),
+            ));
         }
     }
     let compression_type = src[len - 5];
@@ -288,9 +288,9 @@ fn split_block_tracer<C: Comparator>(src: &mut Bytes, opts: &Opts<C>) -> Result<
         SNAPPY_COMPRESSION_BLOCK_TYPE => match Decoder::new().decompress_vec(src.as_ref()) {
             Ok(d) => Bytes::from(d),
             Err(_) => {
-                return Err(LError::InvalidFile(format!(
-                    "invalid block for unable to decompress"
-                )))
+                return Err(LError::InvalidFile(
+                    "invalid block for unable to decompress".into(),
+                ))
             }
         },
         o => {
@@ -434,11 +434,11 @@ impl<T: Encoding + Clone> Encoding for Entry<T> {
 
     fn decode<C: Comparator>(src: &mut Bytes, opts: &Opts<C>) -> Result<Self, LError> {
         let shared_bytes =
-            take_uvarint(src).ok_or(LError::InvalidFile(format!("invalid shared_bytes")))? as u32;
+            take_uvarint(src).ok_or(LError::InvalidFile("invalid shared_bytes".into()))? as u32;
         let unshared_bytes =
-            take_uvarint(src).ok_or(LError::InvalidFile(format!("invalid unshared_bytes")))? as u32;
+            take_uvarint(src).ok_or(LError::InvalidFile("invalid unshared_bytes".into()))? as u32;
         let value_length =
-            take_uvarint(src).ok_or(LError::InvalidFile(format!("invalid value_len")))? as u32;
+            take_uvarint(src).ok_or(LError::InvalidFile("invalid value_len".into()))? as u32;
         let key_delta = src.split_to(unshared_bytes as usize);
         let mut v = src.split_to(value_length as usize);
         let value = T::decode(&mut v, opts)?;

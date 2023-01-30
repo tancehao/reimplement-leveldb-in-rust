@@ -1,7 +1,9 @@
 use crate::compare::Comparator;
 use crate::opts::Opts;
-use crate::LError;
+use crate::utils::call_on_drop::CallOnDrop;
+use crate::{call_on_drop, LError};
 use bytes::{BufMut, Bytes, BytesMut};
+use file_lock::{FileLock, FileOptions};
 use std::cmp::min;
 use std::collections::HashMap;
 use std::env::current_dir;
@@ -9,7 +11,9 @@ use std::fs::{File, OpenOptions};
 use std::io::SeekFrom;
 use std::os::unix::fs::MetadataExt;
 
+use lazy_static::lazy_static;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 pub(crate) trait Encoding: Sized {
     fn encode<T: Comparator>(&self, dst: &mut BytesMut, opts: &Opts<T>) -> usize;
@@ -119,7 +123,7 @@ impl Storage for MemFile {
 }
 
 // TODO: should use AsRef<Path> instead of &str
-pub trait StorageSystem: Clone + Send + Sync + 'static {
+pub trait StorageSystem: Send + Sync + 'static {
     type O;
     fn open(&self, name: &str) -> Result<Self::O, LError>;
 
@@ -135,8 +139,12 @@ pub trait StorageSystem: Clone + Send + Sync + 'static {
 
     fn exists(&self, name: &str) -> Result<bool, LError>;
 
-    fn mkdir(&self, name: &str) -> Result<(), LError>;
+    fn mkdir_all(&self, name: &str) -> Result<(), LError>;
+
+    fn lock(&self, name: &str) -> Result<Box<dyn Send>, LError>;
 }
+
+pub static OS_FS: OsFS = OsFS {};
 
 #[derive(Default, Copy, Clone)]
 pub struct OsFS {}
@@ -155,8 +163,8 @@ impl StorageSystem for OsFS {
             .ok_or(LError::UnsupportedSystem(format!("pwd unsupported")))
     }
 
-    fn mkdir(&self, name: &str) -> Result<(), LError> {
-        std::fs::DirBuilder::new().create(name)?;
+    fn mkdir_all(&self, name: &str) -> Result<(), LError> {
+        std::fs::DirBuilder::new().recursive(true).create(name)?;
         Ok(())
     }
 
@@ -205,6 +213,16 @@ impl StorageSystem for OsFS {
             }
         }
     }
+
+    fn lock(&self, name: &str) -> Result<Box<dyn Send>, LError> {
+        let opts = FileOptions::new().read(true).write(true).create(true);
+        let l = FileLock::lock(name, true, opts)?;
+        Ok(Box::new(l))
+    }
+}
+
+lazy_static! {
+    pub(crate) static ref MEM_FS: MemFS = MemFS::default();
 }
 
 #[derive(Clone, Default)]
@@ -228,12 +246,11 @@ impl StorageSystem for MemFS {
         Ok(".".to_string())
     }
 
-    fn mkdir(&self, name: &str) -> Result<(), LError> {
-        let f = self.files.lock()?;
-        match f.get(name) {
-            Some(_) => Err(LError::Internal("dir already exists".to_string())),
-            None => Ok(()),
-        }
+    fn mkdir_all(&self, name: &str) -> Result<(), LError> {
+        let mut f = self.files.lock()?;
+        f.entry(name.to_string())
+            .or_insert(MemFile::new(Mutex::new((vec![], 0))));
+        Ok(())
     }
 
     fn create(&self, name: &str) -> Result<Self::O, LError> {
@@ -271,5 +288,25 @@ impl StorageSystem for MemFS {
     fn exists(&self, name: &str) -> Result<bool, LError> {
         let files = self.files.lock()?;
         Ok(files.contains_key(name))
+    }
+
+    fn lock(&self, name: &str) -> Result<Box<dyn Send>, LError> {
+        loop {
+            let mut files = self.files.lock()?;
+            match files.get(name) {
+                None => {
+                    let f = MemFile::new(Mutex::new((vec![], 0)));
+                    let fs = self.clone();
+                    files.insert(name.to_string(), f);
+                    let filename = name.to_string();
+                    return Ok(Box::new(call_on_drop!({
+                        let _ = fs.remove(filename.as_str());
+                    })));
+                }
+                Some(_) => {
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+            }
+        }
     }
 }

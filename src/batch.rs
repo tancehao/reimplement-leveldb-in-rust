@@ -83,9 +83,9 @@ impl Encoding for Batch {
 
     fn decode<T: Comparator>(src: &mut Bytes, _opts: &Opts<T>) -> Result<Self, LError> {
         let must_take_uvarint = |src: &mut Bytes| -> Result<u64, LError> {
-            take_uvarint(src).ok_or(LError::InvalidFile(format!(
-                "the WAL file is malformat for uvarint is invalid"
-            )))
+            take_uvarint(src).ok_or(LError::InvalidFile(
+                "the WAL file is malformat for uvarint is invalid".into(),
+            ))
         };
         let seq_num = must_take_uvarint(src)?;
         let cnt = must_take_uvarint(src)?;
@@ -102,7 +102,7 @@ impl Encoding for Batch {
                 }
                 _ => {
                     return Err(LError::InvalidFile(
-                        "the WAL file is malformat for invalid key kind".to_string(),
+                        "the WAL file is malformat for invalid key kind".into(),
                     ))
                 }
             };

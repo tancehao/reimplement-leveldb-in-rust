@@ -48,9 +48,9 @@ impl<C: Comparator, S: Storage> SSTableWriter<C, S> {
                 if let Ordering::Greater =
                     self.opts.get_comparator().compare(k.as_ref(), key.as_ref())
                 {
-                    return Err(LError::Internal(format!(
-                        "keys are set in non-increasing order"
-                    )));
+                    return Err(LError::Internal(
+                        "keys are set in non-increasing order".into(),
+                    ));
                 }
             }
         }
@@ -149,6 +149,7 @@ impl<C: Comparator, S: Storage> SSTableWriter<C, S> {
                 Filter::from_sstable_block(dst.freeze(), &BLOOM_FILTER, &self.opts)
             }
         };
+        // TODO: the underlying file should be set non-writable
         Ok(SSTableReader {
             num: self.num,
             f: Arc::new(Mutex::new(self.file)),
@@ -192,7 +193,7 @@ impl FilterWriter {
     fn append_offset(&mut self) -> Result<(), LError> {
         let o = self.data.len() as u64;
         if o > (1u64 << 32 - 1) {
-            return Err(LError::Filter(format!("filter data is too long")));
+            return Err(LError::Filter("filter data is too long".into()));
         }
         self.offsets.push(o as u32);
         Ok(())

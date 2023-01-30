@@ -1,4 +1,4 @@
-use crate::compare::{BytewiseComparator, Comparator};
+use crate::compare::Comparator;
 use crate::db::BGWorkTask;
 use crate::filename::{db_filename, set_current_file, FileType};
 use crate::io::{Encoding, Storage, StorageSystem};
@@ -13,11 +13,11 @@ use crossbeam::channel::Sender;
 use std::cmp::Ordering;
 use std::collections::HashSet;
 use std::fmt::{Debug, Formatter};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 pub const LEVELS: usize = 7;
 
-pub(crate) struct VersionSet<C: Comparator, O: Storage, S: StorageSystem<O = O>> {
+pub(crate) struct VersionSet<C: Comparator, O: Storage> {
     dirname: String,
     opts: Opts<C>,
     ucmp: C,
@@ -29,22 +29,22 @@ pub(crate) struct VersionSet<C: Comparator, O: Storage, S: StorageSystem<O = O>>
     pub(crate) block_cache: BlockCache,
 
     pub(crate) log_number: u64,
-    next_file_number: u64,
-    last_sequence: u64,
+    pub(crate) next_file_number: u64,
+    pub(crate) last_sequence: u64,
 
     // TODO: need to move this to Opts
-    pub(crate) fs: S,
+    pub(crate) fs: &'static dyn StorageSystem<O = O>,
 
-    manifest_file_number: u64,
-    manifest_file: Option<WalWriter<S::O>>,
+    pub(crate) manifest_file_number: u64,
+    pub(crate) manifest_file: Arc<Mutex<Option<WalWriter<O>>>>,
 }
 
-impl<C: Comparator, O: Storage, S: StorageSystem<O = O>> VersionSet<C, O, S> {
+impl<C: Comparator, O: Storage> VersionSet<C, O> {
     pub(crate) fn new(
         dirname: String,
         event_trigger: Sender<BGWorkTask>,
         opts: Opts<C>,
-        fs: S,
+        fs: &'static dyn StorageSystem<O = O>,
     ) -> Self {
         Self {
             dirname: dirname,
@@ -57,7 +57,7 @@ impl<C: Comparator, O: Storage, S: StorageSystem<O = O>> VersionSet<C, O, S> {
             next_file_number: 0,
             last_sequence: 0,
             manifest_file_number: 0,
-            manifest_file: None,
+            manifest_file: Arc::new(Mutex::new(None)),
             clean_trigger: event_trigger,
             fs,
         }
@@ -91,7 +91,7 @@ impl<C: Comparator, O: Storage, S: StorageSystem<O = O>> VersionSet<C, O, S> {
         }
     }
 
-    pub(crate) fn load(&mut self) -> Result<(), LError> {
+    pub(crate) fn load(&mut self, opts: Opts<C>) -> Result<(), LError> {
         let manifest_name = {
             let mut f = self
                 .fs
@@ -126,7 +126,6 @@ impl<C: Comparator, O: Storage, S: StorageSystem<O = O>> VersionSet<C, O, S> {
             .fs
             .open(format!("{}/{}", self.dirname, manifest_name).as_str())?;
         let mut ww = WalReader::new(manifest_file, manifest_name)?;
-        let opts: Opts<BytewiseComparator> = Opts::default();
         let mut version = Version::default();
         let copy_if_meaningful = |dst: &mut u64, src: u64| {
             if src != 0 {
@@ -182,76 +181,7 @@ impl<C: Comparator, O: Storage, S: StorageSystem<O = O>> VersionSet<C, O, S> {
         Ok(())
     }
 
-    pub fn create_manifest(&mut self, dirname: &str) -> Result<(), LError> {
-        let filename = db_filename(dirname, FileType::Manifest(self.manifest_file_number));
-        let f = self.fs.create(filename.as_str())?;
-        match self.create_manifest_inner(f) {
-            Ok(_) => Ok(()),
-            Err(e) => {
-                self.fs.remove(filename.as_str())?;
-                Err(e)
-            }
-        }
-    }
-
-    fn create_manifest_inner(&mut self, f: S::O) -> Result<(), LError> {
-        let mut ww = WalWriter::new(f);
-        let mut snapshot = VersionEdit::empty();
-        snapshot.comparator_name = self.ucmp.name().to_string();
-        for (level, files) in self.version.files.iter().enumerate() {
-            for file in files {
-                snapshot.new_files.push(NewFileEntry(level, file.clone()));
-            }
-        }
-        let mut log = BytesMut::new();
-        snapshot.encode(&mut log, &self.opts);
-        ww.append(log.as_ref())?;
-        self.manifest_file = Some(ww);
-        Ok(())
-    }
-
-    // TODO: lock is held when calling this method. maybe optimization is possible
-    pub(crate) fn log_and_apply(
-        &mut self,
-        dirname: &str,
-        ve: &mut VersionEdit<O>,
-    ) -> Result<(), LError> {
-        if ve.log_number != 0 {
-            if ve.log_number < self.log_number || ve.log_number >= self.next_file_number {
-                panic!("inconsistent VersionEdit log_number: {}", ve.log_number);
-            }
-        }
-        if ve.log_number == 0 {
-            ve.log_number = self.log_number;
-        }
-        ve.next_file_number = self.next_file_number;
-        ve.last_sequence = self.last_sequence;
-        let new_version = self.version.edit(ve);
-
-        if self.manifest_file.is_none() {
-            self.create_manifest(dirname)?;
-            // the manifest file is empty now.
-            // we should write the snapshot as a baseline of later modifications.
-            let mut log = BytesMut::new();
-            let snapshot = self.make_snapshot();
-            snapshot.encode(&mut log, &self.opts);
-            self.manifest_file.as_mut().unwrap().append(log.as_ref())?;
-        }
-
-        let ww = self.manifest_file.as_mut().unwrap();
-        let mut log = BytesMut::new();
-        ve.encode(&mut log, &self.opts);
-        ww.append(log.as_ref())?;
-        ww.flush()?;
-        set_current_file(&self.fs, dirname, self.manifest_file_number)?;
-        self.set_version(Arc::new(new_version));
-        if ve.log_number != 0 {
-            self.log_number = ve.log_number;
-        }
-        Ok(())
-    }
-
-    fn make_snapshot(&self) -> VersionEdit<O> {
+    pub(crate) fn make_snapshot(&self) -> VersionEdit<O> {
         let mut ve = VersionEdit::empty();
         for (level, files) in self.current_version().files.iter().enumerate() {
             files.iter().for_each(|x| ve.new_file(level, x.clone()));
@@ -260,7 +190,7 @@ impl<C: Comparator, O: Storage, S: StorageSystem<O = O>> VersionSet<C, O, S> {
         ve
     }
 
-    fn set_version(&mut self, v: VersionPtr<O>) {
+    pub(crate) fn set_version(&mut self, v: VersionPtr<O>) {
         self.version = v;
     }
 
@@ -276,7 +206,6 @@ impl<C: Comparator, O: Storage, S: StorageSystem<O = O>> VersionSet<C, O, S> {
         const MANIFEST_FILE_NUM: u64 = 1;
         self.mark_file_num_used(MANIFEST_FILE_NUM + 1);
         let mn = db_filename(self.dirname.as_str(), FileType::Manifest(MANIFEST_FILE_NUM));
-        self.fs.mkdir(self.dirname.as_str())?;
         let manifest_file = self.fs.create(mn.as_str())?;
         let mut manifest_writer = WalWriter::new(manifest_file);
         let mut buf = BytesMut::new();
@@ -286,7 +215,7 @@ impl<C: Comparator, O: Storage, S: StorageSystem<O = O>> VersionSet<C, O, S> {
         ve.encode(&mut buf, &self.opts);
         manifest_writer.append(buf.as_ref())?;
         manifest_writer.flush()?;
-        set_current_file(&self.fs, self.dirname.as_str(), MANIFEST_FILE_NUM)
+        set_current_file(self.fs, self.dirname.as_str(), MANIFEST_FILE_NUM)
     }
 }
 
@@ -384,7 +313,7 @@ impl<S: Storage> Version<S> {
         self.files[l].as_ref()
     }
 
-    fn edit(&self, ve: &VersionEdit<S>) -> Version<S> {
+    pub(crate) fn edit(&self, ve: &VersionEdit<S>) -> Version<S> {
         let mut new_version = Version::default();
         for (level, files) in new_version.files.iter_mut().enumerate() {
             for file in self.files[level].iter() {
@@ -518,18 +447,17 @@ impl<S: Storage> Version<S> {
     }
 }
 
+// TODO use Option types to mask if a field exists instead of their zero value
 #[derive(Default)]
 pub(crate) struct VersionEdit<S: Storage> {
-    comparator_name: String,
+    pub comparator_name: String,
     // file number of WAL
-    log_number: u64,
-    // unused
-    prev_log_number: u64,
-    next_file_number: u64,
-    last_sequence: u64,
-    compact_pointers: Vec<CompactPointerEntry>,
-    deleted_files: HashSet<DeleteFileEntry>,
-    new_files: Vec<NewFileEntry<S>>,
+    pub(crate) log_number: u64,
+    pub(crate) next_file_number: u64,
+    pub(crate) last_sequence: u64,
+    pub(crate) compact_pointers: Vec<CompactPointerEntry>,
+    pub(crate) deleted_files: HashSet<DeleteFileEntry>,
+    pub(crate) new_files: Vec<NewFileEntry<S>>,
 }
 
 impl<S: Storage> Debug for VersionEdit<S> {
@@ -570,7 +498,6 @@ impl<S: Storage> VersionEdit<S> {
         Self {
             comparator_name: String::new(),
             log_number: 0,
-            prev_log_number: 0,
             next_file_number: 0,
             last_sequence: 0,
             compact_pointers: vec![],
@@ -612,10 +539,7 @@ impl<S: Storage> Encoding for VersionEdit<S> {
             put_uvarint(dst, TAG_LOG_NUMBER);
             put_uvarint(dst, self.log_number);
         }
-        if self.prev_log_number != 0 {
-            put_uvarint(dst, TAG_PREV_LOG_NUMBER);
-            put_uvarint(dst, self.prev_log_number);
-        }
+
         if self.next_file_number != 0 {
             put_uvarint(dst, TAG_NEXT_FILE_NUMBER);
             put_uvarint(dst, self.next_file_number);
@@ -651,11 +575,9 @@ impl<S: Storage> Encoding for VersionEdit<S> {
     fn decode<T: Comparator>(src: &mut Bytes, _opts: &Opts<T>) -> Result<Self, LError> {
         let mut ve = VersionEdit::empty();
         let must_take_uvarint = |src: &mut Bytes| -> Result<u64, LError> {
-            take_uvarint(src).ok_or(LError::InvalidFile(format!(
-                "the MANIFEST file is malformat"
-            )))
+            take_uvarint(src).ok_or(LError::InvalidFile("the MANIFEST file is malformat".into()))
         };
-        let e = LError::InvalidFile(format!("the MANIFEST file is malformat"));
+        let e = LError::InvalidFile("the MANIFEST file is malformat".into());
         loop {
             match take_uvarint(src) {
                 None => break,
@@ -670,7 +592,6 @@ impl<S: Storage> Encoding for VersionEdit<S> {
                     TAG_LOG_NUMBER => ve.log_number = must_take_uvarint(src)?,
                     TAG_NEXT_FILE_NUMBER => ve.next_file_number = must_take_uvarint(src)?,
                     TAG_LAST_SEQUENCE => ve.last_sequence = must_take_uvarint(src)?,
-                    TAG_PREV_LOG_NUMBER => ve.prev_log_number = must_take_uvarint(src)?,
                     TAG_COMPACT_POINTER => {
                         let level = must_take_uvarint(src)? as usize;
                         let kl = must_take_uvarint(src)? as u8;
@@ -719,7 +640,6 @@ const TAG_LAST_SEQUENCE: u64 = 4;
 const TAG_COMPACT_POINTER: u64 = 5;
 const TAG_DELETED_FILE: u64 = 6;
 const TAG_NEW_FILE: u64 = 7;
-const TAG_PREV_LOG_NUMBER: u64 = 9;
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct CompactPointerEntry(usize, InternalKey);

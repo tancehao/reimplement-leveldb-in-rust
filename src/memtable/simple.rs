@@ -101,7 +101,7 @@ mod test {
     fn test_btmap() {
         let mut m = BTMap::default();
         let mut ks = HashSet::new();
-        for i in (1000u64..10000) {
+        for i in 1000u64..10000 {
             ks.insert(i);
         }
         // unordered

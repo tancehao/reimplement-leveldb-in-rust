@@ -66,8 +66,8 @@ pub(crate) fn parse_dbname(fullname: &str) -> Option<FileType> {
     }
 }
 
-pub(crate) fn set_current_file<O: Storage, S: StorageSystem<O = O>>(
-    fs: &S,
+pub(crate) fn set_current_file<S: Storage>(
+    fs: &'static dyn StorageSystem<O = S>,
     dirname: &str,
     num: u64,
 ) -> Result<(), LError> {
