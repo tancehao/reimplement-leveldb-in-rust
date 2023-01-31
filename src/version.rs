@@ -19,7 +19,7 @@ pub const LEVELS: usize = 7;
 
 pub(crate) struct VersionSet<C: Comparator, O: Storage> {
     dirname: String,
-    opts: Opts<C>,
+    pub(crate) opts: Opts<C>,
     ucmp: C,
     #[allow(unused)]
     icmp: InternalKeyComparator<C>,

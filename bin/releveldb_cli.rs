@@ -101,6 +101,7 @@ fn get_opts(a: Any) -> Opts<BytewiseComparator> {
         max_file_size: 4 * 1024 * 1024,
         // compact_hook: (a, log_compaction),
         compact_hook: (a, empty_compact_hook),
+        flush_wal: false,
     })
 }
 

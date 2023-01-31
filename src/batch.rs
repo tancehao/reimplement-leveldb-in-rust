@@ -16,6 +16,10 @@ impl Batch {
         self.seq_num = seq;
     }
 
+    pub fn get_seq_num(&self) -> u64 {
+        self.seq_num
+    }
+
     pub fn count(&self) -> usize {
         self.kvs.len()
     }

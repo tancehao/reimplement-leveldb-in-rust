@@ -54,7 +54,7 @@ impl<C: Comparator, S: Storage, M: MemTable> Clone for DB<C, S, M> {
 
 pub(crate) struct MemDB<M: MemTable, S: Storage> {
     mem: M,
-    wal: Option<(Arc<Mutex<WalWriter<S>>>, u64)>,
+    wal: Option<Wal<S>>,
 }
 
 impl<M: MemTable, S: Storage> Deref for MemDB<M, S> {
@@ -67,7 +67,23 @@ impl<M: MemTable, S: Storage> Deref for MemDB<M, S> {
 
 impl<M: MemTable, S: Storage> MemDB<M, S> {
     pub(crate) fn wal_log_num(&self) -> Option<u64> {
-        self.wal.as_ref().map(|(_, x)| *x)
+        self.wal.as_ref().map(|x| x.file_num)
+    }
+}
+
+pub(crate) struct Wal<S: Storage> {
+    writer: Arc<Mutex<WalWriter<S>>>,
+    file_num: u64,
+    buf: Arc<Mutex<VecDeque<Arc<Batch>>>>,
+}
+
+impl<S: Storage> Wal<S> {
+    pub(crate) fn new(writer: Arc<Mutex<WalWriter<S>>>, file_num: u64) -> Self {
+        Self {
+            writer,
+            file_num,
+            buf: Arc::new(Mutex::new(VecDeque::new())),
+        }
     }
 }
 
@@ -161,8 +177,8 @@ impl<C: Comparator, S: Storage, M: MemTable> DB<C, S, M> {
         }
         let log_number = inner.versions.incr_file_number();
         let wal_name = db_filename(dirname.as_str(), FileType::WAL(log_number));
-        let ww = WalWriter::new(fs.create(wal_name.as_str())?);
-        inner.memdb.wal = Some((Arc::new(Mutex::new(ww)), log_number));
+        let ww = Arc::new(Mutex::new(WalWriter::new(fs.create(wal_name.as_str())?)));
+        inner.memdb.wal = Some(Wal::new(ww, log_number));
         drop(inner);
         db.start_bgwork(bgwork_rx);
         Ok(db)
@@ -268,7 +284,10 @@ impl<C: Comparator, S: Storage, M: MemTable> DB<C, S, M> {
             let new_wal_writer = WalWriter::new(new_wal_file);
             let new_memdb = MemDB {
                 mem: M::empty(),
-                wal: Some((Arc::new(Mutex::new(new_wal_writer)), new_log_number)),
+                wal: Some(Wal::new(
+                    Arc::new(Mutex::new(new_wal_writer)),
+                    new_log_number,
+                )),
             };
             inner.imem = Some(Arc::new(std::mem::replace(&mut inner.memdb, new_memdb)));
             inner.versions.log_number = new_log_number;
@@ -365,7 +384,7 @@ impl<C: Comparator, O: Storage, M: MemTable> DB<C, O, M> {
         self.apply(batch)
     }
 
-    // FIXME: should return a struct and the client is responsible for displaying
+    // FIXME: should return a struct and it's the caller's responsibility to display
     pub fn info(&self) -> Result<String, LError> {
         use std::fmt::Write;
         let mut info = String::new();
@@ -388,8 +407,8 @@ impl<C: Comparator, O: Storage, M: MemTable> DB<C, O, M> {
         writeln!(info, "exists={}", inner.imem.is_some())?;
         writeln!(info, "[WAL]")?;
         writeln!(info, "exists={}", inner.memdb.wal.is_some())?;
-        if let Some((_, lognum)) = inner.memdb.wal.as_ref() {
-            writeln!(info, "num={}", *lognum)?;
+        if let Some(n) = inner.memdb.wal_log_num() {
+            writeln!(info, "num={}", n)?;
         }
         writeln!(info, "[VERSIONS]")?;
         writeln!(info, "last_sequence={}", inner.versions.last_sequence())?;
@@ -413,20 +432,36 @@ impl<C: Comparator, O: Storage, M: MemTable> DB<C, O, M> {
         let mut inner = self.inner.lock()?;
         batch.set_seq_num(inner.versions.last_sequence() + 1);
         inner.versions.advance_last_sequence(batch.count() as u64);
-        let mut log = BytesMut::new();
-        batch.encode(&mut log, &self.opts);
+        let batch_ptr = Arc::new(batch);
+        // batch.encode(&mut log, &self.opts);
 
         // we're going to write wal and it may block.
         // release the lock and acquire it again later
-        if let Some(wal) = inner.memdb.wal.as_ref().map(|(x, _)| x.clone()) {
-            let mut wal_guard = wal.lock()?;
+        if let Some(wal) = inner.memdb.wal.as_mut() {
+            let flush_wal = self.opts.get_flush_wal();
+            wal.buf.lock()?.push_back(batch_ptr.clone());
+            let (writer, buf) = (wal.writer.clone(), wal.buf.clone());
+            // now we drop the `inner` lock and other threads having entered this method
+            // may be able to acquire it and push their Batch to the buf queue. And the thread
+            // who acquire the `writer` lock later is able to write all these buffered batches
+            // to WAL file in a single write and flush.
             drop(inner);
-            wal_guard.append(log.as_ref())?;
-            drop(wal_guard);
+            let mut ww = writer.lock()?;
+            let mut buf = buf.lock()?;
+            let mut log = BytesMut::new();
+            while let Some(b) = buf.pop_front() {
+                b.encode(&mut log, &self.opts);
+            }
+            ww.append(log.as_ref())?;
+            if flush_wal {
+                ww.flush()?;
+            }
+            drop(ww);
+            drop(buf);
             inner = self.inner.lock()?;
         }
 
-        for (seq_num, k, v) in batch.iter() {
+        for (seq_num, k, v) in batch_ptr.iter() {
             match v {
                 Some(val) => inner.memdb.mem.set(k.clone(), seq_num, val.clone()),
                 None => inner.memdb.mem.del(k.clone(), seq_num),

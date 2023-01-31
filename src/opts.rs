@@ -17,6 +17,7 @@ pub struct OptsRaw<T> {
     pub write_buffer_size: u64,
     pub max_file_size: u64,
     pub compact_hook: (Any, CompactHook),
+    pub flush_wal: bool,
 }
 
 pub fn default_opts() -> Opts<BytewiseComparator> {
@@ -37,6 +38,7 @@ impl<C: Comparator + Default> Default for OptsRaw<C> {
             write_buffer_size: 4 * 1024 * 1024,
             max_file_size: 4 * 1024 * 1024,
             compact_hook: (Any::new(()), empty_compact_hook),
+            flush_wal: true,
         }
     }
 }
@@ -84,6 +86,10 @@ impl<T: Comparator> OptsRaw<T> {
 
     pub fn get_compact_hook(&self) -> CompactHook {
         self.compact_hook.1
+    }
+
+    pub fn get_flush_wal(&self) -> bool {
+        self.flush_wal
     }
 }
 
