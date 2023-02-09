@@ -1,30 +1,31 @@
-use crate::compare::{BytewiseComparator, Comparator};
+use crate::compare::{ComparatorImpl, BYTEWISE_COMPARATOR};
 use crate::utils::any::Any;
 use bytes::Bytes;
 use std::sync::Arc;
 
-pub type Opts<C> = Arc<OptsRaw<C>>;
+pub type Opts = Arc<OptsRaw>;
 
-pub struct OptsRaw<T> {
+pub struct OptsRaw {
     pub filter_name: Option<String>,
     pub verify_checksum: bool,
     pub block_cache_limit: usize,
     pub block_restart_interval: usize,
     pub block_size: usize,
     pub compression: bool,
-    pub comparer: T,
+    pub comparer: ComparatorImpl,
     pub error_if_db_exists: bool,
     pub write_buffer_size: u64,
     pub max_file_size: u64,
     pub compact_hook: (Any, CompactHook),
     pub flush_wal: bool,
+    pub tiered_parallel: bool,
 }
 
-pub fn default_opts() -> Opts<BytewiseComparator> {
+pub fn default_opts() -> Opts {
     Arc::new(OptsRaw::default())
 }
 
-impl<C: Comparator + Default> Default for OptsRaw<C> {
+impl Default for OptsRaw {
     fn default() -> Self {
         Self {
             filter_name: None,
@@ -33,19 +34,20 @@ impl<C: Comparator + Default> Default for OptsRaw<C> {
             block_restart_interval: 16,
             block_size: 4096,
             compression: true,
-            comparer: C::default(),
+            comparer: BYTEWISE_COMPARATOR,
             error_if_db_exists: false,
             write_buffer_size: 4 * 1024 * 1024,
             max_file_size: 4 * 1024 * 1024,
             compact_hook: (Any::new(()), empty_compact_hook),
             flush_wal: true,
+            tiered_parallel: true,
         }
     }
 }
 
-impl<T: Comparator> OptsRaw<T> {
-    pub fn get_comparator(&self) -> T {
-        self.comparer.clone()
+impl OptsRaw {
+    pub fn get_comparator(&self) -> ComparatorImpl {
+        self.comparer
     }
 
     pub fn get_block_restart_interval(&self) -> usize {
@@ -90,6 +92,10 @@ impl<T: Comparator> OptsRaw<T> {
 
     pub fn get_flush_wal(&self) -> bool {
         self.flush_wal
+    }
+
+    pub fn get_tiered_parallel(&self) -> bool {
+        self.tiered_parallel
     }
 }
 

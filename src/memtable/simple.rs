@@ -1,4 +1,5 @@
-use crate::compare::Comparator;
+use std::cmp::max;
+use crate::compare::ComparatorImpl;
 use crate::memtable::MemTable;
 use bytes::Bytes;
 use std::collections::BTreeMap;
@@ -7,6 +8,7 @@ use std::collections::BTreeMap;
 pub struct BTMap {
     size_hint: u64,
     data: BTreeMap<Bytes, (u64, Option<Bytes>)>,
+    seq_num: u64,
 }
 
 impl MemTable for BTMap {
@@ -14,7 +16,12 @@ impl MemTable for BTMap {
         BTMap {
             size_hint: 0,
             data: BTreeMap::new(),
+            seq_num: 0,
         }
+    }
+
+    fn last_seq_num(&self) -> u64 {
+        self.seq_num
     }
 
     fn approximate_size(&self) -> u64 {
@@ -25,24 +32,24 @@ impl MemTable for BTMap {
         self.data.len()
     }
 
-    fn get(&self, key: &[u8]) -> Option<Bytes> {
-        match self.data.get(key) {
-            None => None,
-            Some((_, v)) => v.clone(),
-        }
+    fn get(&self, key: &[u8]) -> Option<Option<Bytes>> {
+        self.data.get(key).map(|(_, x)| x.clone())
     }
 
     fn set(&mut self, key: Bytes, seq_num: u64, value: Bytes) {
         match self.data.get_mut(&key) {
             None => {
                 self.size_hint += (key.len() + 8 + value.len()) as u64;
-                self.data.insert(key, (seq_num, Some(value)));
+                self.data.insert(key.clone(), (seq_num, Some(value)));
+                self.seq_num = max(seq_num, self.seq_num);
             }
             Some((seq, oldv)) => {
                 if *seq < seq_num {
                     self.size_hint += value.len() as u64;
                     self.size_hint -= oldv.as_ref().map(|x| x.len()).unwrap_or_default() as u64;
                     *oldv = Some(value);
+                    *seq = seq_num;
+                    self.seq_num = seq_num;
                 }
             }
         }
@@ -53,18 +60,21 @@ impl MemTable for BTMap {
             None => {
                 self.size_hint += (key.len() + 8) as u64;
                 self.data.insert(key, (seq_num, None));
+                self.seq_num = max(seq_num, self.seq_num);
             }
             Some((seq, oldv)) => {
                 if *seq < seq_num {
                     self.size_hint -= oldv.as_ref().map(|x| x.len()).unwrap_or_default() as u64;
                     *oldv = None;
+                    *seq = seq_num;
+                    self.seq_num = seq_num;
                 }
             }
         }
     }
 
-    // a litter inefficient here. maybe we can keep the btmap in expected order when inserting or updating.
-    fn iter<C: Comparator>(&self, c: C) -> Box<dyn Iterator<Item = (Bytes, u64, Option<Bytes>)>> {
+    // a little inefficient here. maybe we can keep the btmap in expected order when inserting or updating.
+    fn iter(&self, c: ComparatorImpl) -> Box<dyn Iterator<Item = (Bytes, u64, Option<Bytes>)>> {
         let mut kvs: Vec<(Bytes, u64, Option<Bytes>)> = self
             .data
             .iter()
@@ -91,11 +101,11 @@ impl Iterator for BTMapIter {
 
 #[cfg(test)]
 mod test {
-    use crate::compare::BytewiseComparator;
+    use crate::compare::BYTEWISE_COMPARATOR;
     use crate::memtable::simple::BTMap;
     use crate::memtable::MemTable;
     use bytes::Bytes;
-    use std::collections::HashSet;
+    use std::collections::{HashMap, HashSet};
 
     #[test]
     fn test_btmap() {
@@ -104,7 +114,7 @@ mod test {
         for i in 1000u64..10000 {
             ks.insert(i);
         }
-        // unordered
+
         let kvs: Vec<(Bytes, u64, Bytes)> = ks
             .iter()
             .map(|x| {
@@ -117,20 +127,20 @@ mod test {
             .collect();
 
         for (k, n, v) in kvs.iter() {
-            m.set(k.clone(), *n, v.clone());
             if *n % 20 == 0 {
-                m.del(k.clone(), *n + 10000);
+                m.del(k.clone(), *n);
+            } else {
+                m.set(k.clone(), *n, v.clone());
             }
         }
         assert_eq!(m.len(), 9000);
         for (k, n, v) in kvs.iter() {
             assert_eq!(
                 m.get(k.as_ref()),
-                if *n % 20 == 0 { None } else { Some(v.clone()) }
+                if *n % 20 == 0 { Some(None) } else { Some(Some(v.clone())) }
             );
         }
-        let c = BytewiseComparator::default();
-        let mut i = m.iter(c);
+        let mut i = m.iter(BYTEWISE_COMPARATOR);
         let mut prev = 0;
         let mut cnt = 0;
         while let Some((_, n, _)) = i.next() {

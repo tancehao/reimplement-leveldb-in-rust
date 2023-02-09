@@ -10,7 +10,7 @@ const RECORD_TYPE_FIRST: u8 = 2;
 const RECORD_TYPE_MIDDLE: u8 = 3;
 const RECORD_TYPE_LAST: u8 = 4;
 
-pub(crate) struct WalReader<T: Storage> {
+pub struct WalReader<T: Storage> {
     f: T,
     total_size: u64,
     read_size: u64,
@@ -20,7 +20,7 @@ pub(crate) struct WalReader<T: Storage> {
 }
 
 impl<T: Storage> WalReader<T> {
-    pub(crate) fn new(f: T, fname: String) -> Result<Self, LError> {
+    pub fn new(f: T, fname: String) -> Result<Self, LError> {
         Ok(Self {
             total_size: f.size()?,
             f: f,
@@ -31,7 +31,7 @@ impl<T: Storage> WalReader<T> {
         })
     }
 
-    pub(crate) fn next(&mut self) -> Result<Option<Vec<u8>>, LError> {
+    pub fn next(&mut self) -> Result<Option<Vec<u8>>, LError> {
         let mut log = vec![];
         loop {
             if self.buf.is_empty() {
@@ -41,6 +41,7 @@ impl<T: Storage> WalReader<T> {
                 let mut buf = BytesMut::with_capacity(BLOCK_SIZE);
                 buf.resize(BLOCK_SIZE, 0);
                 self.f.read(&mut buf)?;
+                // println!("buf after read from wal: {:?}", buf);
                 self.buf = buf.freeze();
                 self.read_times += 1;
                 self.read_size += BLOCK_SIZE as u64;
@@ -58,6 +59,7 @@ impl<T: Storage> WalReader<T> {
                 continue;
             }
             let data = self.buf.split_to(length as usize);
+            // println!("self.buf length after split_to: {}, t: {}, data: {:?}", self.buf.len(), t, data);
             if crc32(data.as_ref()) != checksum {
                 return Err(LError::InvalidFile(format!(
                     "data in file {} is malformed",
@@ -105,6 +107,7 @@ impl<T: Storage> WalWriter<T> {
     fn write_buf(&mut self) -> Result<(), LError> {
         while let Some(mut buf) = self.buf.pop_front() {
             if buf.len() > 0 {
+                // println!("writing buf to file: {:?}", buf);
                 self.f.write_all(buf.as_ref())?;
                 let _ = buf.split_to(buf.len());
             }
@@ -136,7 +139,7 @@ impl<T: Storage> WalWriter<T> {
         }
         let buf = self.buf.back_mut().unwrap();
         let space_left = buf.capacity() - buf.len();
-        let s = if length + 7 < space_left {
+        let s = if length + 7 <= space_left {
             buf.put_u32_le(crc32(data));
             buf.put_u16_le(length as u16);
             buf.put_u8(if is_first {

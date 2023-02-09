@@ -1,11 +1,16 @@
 use std::cmp::Ordering;
 use std::fmt::Debug;
 
-pub trait Comparator: Send + Sync + Clone + Debug + Copy + 'static {
+pub static BYTEWISE_COMPARATOR: &'static dyn Comparator =
+    &BytewiseComparator {} as &'static dyn Comparator;
+
+pub trait Comparator: Send + Sync + Debug + 'static {
     fn compare(&self, a: &[u8], b: &[u8]) -> Ordering;
 
     fn name(&self) -> &'static str;
 }
+
+pub type ComparatorImpl = &'static dyn Comparator;
 
 #[derive(Default, Clone, Copy, Debug)]
 pub struct BytewiseComparator {}

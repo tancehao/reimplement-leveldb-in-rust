@@ -38,13 +38,11 @@ impl CallOnDrop {
 #[cfg(test)]
 mod test {
     use super::CallOnDrop;
-    use std::cell::RefCell;
-    use std::rc::Rc;
     use std::sync::atomic::{AtomicI8, Ordering};
     use std::sync::Arc;
 
     #[test]
-    fn test_defer() {
+    fn test_call_on_drop() {
         let x = Arc::new(AtomicI8::new(0));
         let xc = x.clone();
         {

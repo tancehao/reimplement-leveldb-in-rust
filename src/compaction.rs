@@ -1,4 +1,4 @@
-use crate::compare::Comparator;
+use crate::compare::ComparatorImpl;
 use crate::db::{BGWorkTask, ConcatScanner, DBScanner, MergeScanner, DB};
 use crate::filename::{db_filename, FileType};
 use crate::io::Storage;
@@ -12,7 +12,9 @@ use crate::{call_on_drop, unregister, LError};
 use std::cmp::Ordering;
 
 use bytes::Bytes;
+use crossbeam::channel::unbounded;
 use std::fmt::{Debug, Formatter};
+use std::sync::atomic::Ordering::Relaxed;
 
 const TARGET_FILE_SIZE: u64 = 2 * 1024 * 1024;
 const MAX_GRANDPARENT_OVERLAP_BYTES: u64 = 10 * TARGET_FILE_SIZE;
@@ -34,21 +36,21 @@ impl<S: Storage> Debug for Compaction<S> {
 }
 
 impl<S: Storage> Compaction<S> {
-    pub(crate) fn pick_from_version<C: Comparator>(
+    pub(crate) fn pick_from_version(
         version: VersionPtr<S>,
-        ucmp: C,
-        icmp: InternalKeyComparator<C>,
+        ucmp: ComparatorImpl,
+        icmp: InternalKeyComparator,
     ) -> Option<Self> {
         let mut c = Compaction {
             version: version.clone(),
             level: 0,
             inputs: vec![vec![], vec![], vec![]],
         };
-        if version.compaction_score >= 1.0 {
-            // we pick this level because there are too much data in this level.
-            // and we just start from the first file in this group.
-            c.level = version.compaction_level;
-            c.inputs[0] = vec![version.files_in_level(c.level)[0].clone()];
+        if let Some((level, _)) = version.compaction.and_then(|(l, s)| (s >= 1.0).then_some((l, s))) {
+                // we pick this level because there are too much data in this level.
+                // and we just start from the first file in this group.
+                c.level = level;
+                c.inputs[0] = vec![version.files_in_level(level)[0].clone()];
         } else if version.seek_compact.is_some() {
             let (file, level) = version.seek_compact.as_ref().unwrap();
             c.level = *level;
@@ -64,7 +66,7 @@ impl<S: Storage> Compaction<S> {
         Some(c)
     }
 
-    fn setup_other_inputs<C: Comparator>(&mut self, ucmp: C, icmp: InternalKeyComparator<C>) {
+    fn setup_other_inputs(&mut self, ucmp: ComparatorImpl, icmp: InternalKeyComparator) {
         let (sm0, lg0) = ikey_range(icmp, &self.inputs[0], None);
         self.inputs[1] = self
             .version
@@ -82,10 +84,10 @@ impl<S: Storage> Compaction<S> {
         // TODO update the compaction pointer for self.level
     }
 
-    fn grow<C: Comparator>(
+    fn grow(
         &mut self,
-        ucmp: C,
-        icmp: InternalKeyComparator<C>,
+        ucmp: ComparatorImpl,
+        icmp: InternalKeyComparator,
         uk_small: &[u8],
         uk_large: &[u8],
     ) -> bool {
@@ -113,12 +115,10 @@ impl<S: Storage> Compaction<S> {
         true
     }
 
-    fn is_base_level_for_ukey<C: Comparator>(&self, ucmp: C, ukey: &[u8]) -> bool {
+    fn is_base_level_for_ukey(&self, ucmp: ComparatorImpl, ukey: &[u8]) -> bool {
         for level in (self.level + 2)..LEVELS {
             for file in self.version.files_in_level(level) {
-                if !((ucmp.compare(ukey, file.largest.ukey()) == Ordering::Greater)
-                    || (ucmp.compare(ukey, file.smallest.ukey()) == Ordering::Less))
-                {
+                if file.may_contains(ukey, ucmp) {
                     return false;
                 }
             }
@@ -127,7 +127,7 @@ impl<S: Storage> Compaction<S> {
     }
 }
 
-impl<C: Comparator, O: Storage, M: MemTable> DB<C, O, M> {
+impl<O: Storage, M: MemTable> DB<O, M> {
     pub(crate) fn maybe_schedule_compaction(&self) {
         if self.bgwork_trigger.send(BGWorkTask::Compaction).is_err() {
             panic!("bg work thread is broken")
@@ -160,15 +160,14 @@ impl<C: Comparator, O: Storage, M: MemTable> DB<C, O, M> {
             self.compact_imem_table(imem.as_ref(), current_log_number)?;
             // now we have succeed in compacting the imem table to a file.
             // and it's associated WAL can be safely deleted.
-            if let Some(log_num) = compacted_log_num {
-                if self
-                    .bgwork_trigger
-                    .send(BGWorkTask::CleanWAL(log_num))
-                    .is_err()
-                {
-                    panic!("bg work thread is broken")
-                }
+            if self
+                .bgwork_trigger
+                .send(BGWorkTask::CleanWAL(compacted_log_num))
+                .is_err()
+            {
+                panic!("bg work thread is broken")
             }
+
             self.inner.lock()?.imem.take();
             return Ok(true);
         }
@@ -203,7 +202,7 @@ impl<C: Comparator, O: Storage, M: MemTable> DB<C, O, M> {
         Ok(false)
     }
 
-    fn new_sstable_file(&self) -> Result<(u64, SSTableWriter<C, O>, CallOnDrop), LError> {
+    fn new_sstable_file(&self) -> Result<(u64, SSTableWriter<O>, CallOnDrop), LError> {
         let (file_num, file_name, fs) = {
             let mut inner = self.inner.lock()?;
             let file_num = inner.versions.incr_file_number();
@@ -248,17 +247,24 @@ impl<C: Comparator, O: Storage, M: MemTable> DB<C, O, M> {
         let size = new_table.wrote_size() as u64;
         let mut reader = new_table.freeze()?;
         reader.set_cache_handle(self.inner.lock()?.versions.block_cache.clone());
-        ve.new_file(
-            0,
-            DataFilePtr::new(DataFile {
-                num: file_num,
-                size,
-                smallest: smallest.unwrap(),
-                largest: largest.unwrap(),
-                file: Some(reader),
-                clean_trigger: Some(self.bgwork_trigger.clone()),
-            }),
-        );
+        let (tx, rx) = unbounded();
+        let df = DataFile {
+            num: file_num,
+            size,
+            smallest: smallest.unwrap(),
+            largest: largest.unwrap(),
+            file: Some(reader),
+            key_stream: Some(tx),
+        };
+        let dfp = DataFilePtr::new(df);
+        let file = dfp.file.clone();
+        let metric = self.metric.clone();
+        std::thread::spawn(move || {
+            metric.threads.fetch_add(1, Relaxed);
+            DataFile::serve_queries(file, rx);
+            metric.threads.fetch_sub(1, Relaxed);
+        });
+        ve.new_file(0, dfp);
         ve.set_log_number(log_num);
         self.apply_version_edit(&mut ve)?;
         unregister!(tmpfile_recycler);
@@ -289,7 +295,7 @@ impl<C: Comparator, O: Storage, M: MemTable> DB<C, O, M> {
 
         let mut smallest = None;
         let mut prev_key: Option<InternalKey> = None;
-        let mut new_table: Option<(u64, SSTableWriter<C, O>)> = None;
+        let mut new_table: Option<(u64, SSTableWriter<O>)> = None;
         let mut new_files = vec![];
         let mut tmpfile_recyclers = vec![];
         while let Some((ik, v)) = scanner.next()? {
@@ -350,7 +356,7 @@ impl<C: Comparator, O: Storage, M: MemTable> DB<C, O, M> {
                     smallest,
                     largest,
                     file: Some(reader),
-                    clean_trigger: Some(self.bgwork_trigger.clone()),
+                    key_stream: None,
                 }),
             );
         }
@@ -373,9 +379,8 @@ impl<C: Comparator, O: Storage, M: MemTable> DB<C, O, M> {
 
 #[cfg(test)]
 mod test {
-    use crate::compare::BytewiseComparator;
     use crate::db::{DBScanner, DB};
-    use crate::io::{MemFS, MemFile, Storage, StorageSystem, MEM_FS};
+    use crate::io::{MemFile, Storage, StorageSystem, MEM_FS, MemFS};
     use crate::key::InternalKeyRef;
     use crate::memtable::simple::BTMap;
     use crate::memtable::MemTable;
@@ -383,12 +388,18 @@ mod test {
     use crate::sstable::reader::{SSTableReader, SSTableScanner};
     use std::collections::HashMap;
     use std::sync::Arc;
+    use bytes::Bytes;
+    use lazy_static::lazy_static;
+    use crate::version::{DataFile, DataFilePtr, Version, VersionEdit};
 
     #[test]
     fn test_compact_imem() {
-        let opt_raw: OptsRaw<BytewiseComparator> = OptsRaw::default();
+        let mut  opt_raw: OptsRaw = OptsRaw::default();
         let opts = Arc::new(opt_raw);
-        let fs = &*MEM_FS as &'static dyn StorageSystem<O = MemFile>;
+        lazy_static! {
+            pub(crate) static ref TEST_MEM_FS: MemFS = MemFS::default();
+        }
+        let fs = &*TEST_MEM_FS;
         let db = DB::open("db_dir".to_string(), opts.clone(), fs).unwrap();
         let mut mem = BTMap::default();
         let mut kvs = HashMap::new();
@@ -409,7 +420,7 @@ mod test {
             .next();
         assert!(fno.is_some());
         let file_name = fno.unwrap().clone();
-        let mut f = fs.open(file_name.as_str()).unwrap();
+        let mut f = fs.open(format!("./db_dir/{}", file_name.as_str()).as_str()).unwrap();
         f.seek(0).unwrap();
         assert!(f.size().unwrap() > 0);
         let r = SSTableReader::open(f, 2, &opts).unwrap();
@@ -420,5 +431,34 @@ mod test {
     }
 
     #[test]
-    fn test_compact_disk_tables() {}
+    fn test_compact_disk_tables() {
+        let mut opt_raw: OptsRaw = OptsRaw::default();
+        opt_raw.write_buffer_size = 128;
+        opt_raw.block_size = 512;
+        opt_raw.max_file_size = 2048;
+        let opts = Arc::new(opt_raw);
+        let fs = &*MEM_FS as &'static dyn StorageSystem<O = MemFile>;
+        let db: DB<MemFile, BTMap> = DB::open("disk_tables".to_string(), opts.clone(), fs).unwrap();
+        let mut mem = BTMap::default();
+        let mut kvs = HashMap::new();
+        for i in 0..10000 {
+            let uk = format!("key:{}", i);
+            let value = format!("value:{}:{}:{}", i, i, i);
+            let ik = InternalKeyRef::from((uk.as_ref(), i)).to_owned();
+            kvs.insert(ik, value.clone());
+            assert!(db.set(uk.into(), value.into()).is_ok());
+        }
+        let r = db.compact1();
+        assert!(r.is_ok());
+        let file_list = fs.list("disk_tables").unwrap();
+        for (i, v) in kvs.iter() {
+            let vv = Bytes::from(v.clone());
+            if let Ok(Some(vvv)) = db.get(i.ukey()) {
+                assert_eq!(vvv.as_ref(), vv.as_ref());
+            } else {
+                panic!("not equal");
+            }
+        }
+        // assert!(false);
+    }
 }

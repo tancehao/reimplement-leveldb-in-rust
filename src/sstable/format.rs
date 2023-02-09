@@ -1,4 +1,3 @@
-use crate::compare::Comparator;
 use crate::filter::{BloomFilter, BLOOM_FILTER};
 use crate::io::{Encoding, Storage};
 use crate::key::{InternalKey, InternalKeyRef};
@@ -33,7 +32,7 @@ impl BlockHandle {
 }
 
 impl Encoding for BlockHandle {
-    fn encode<C: Comparator>(&self, dst: &mut BytesMut, _opts: &Opts<C>) -> usize {
+    fn encode(&self, dst: &mut BytesMut, _opts: &Opts) -> usize {
         let s0 = dst.len();
         put_uvarint(dst, self.offset);
         put_uvarint(dst, self.length);
@@ -44,7 +43,7 @@ impl Encoding for BlockHandle {
         20
     }
 
-    fn decode<C: Comparator>(src: &mut Bytes, _opts: &Opts<C>) -> Result<Self, LError> {
+    fn decode(src: &mut Bytes, _opts: &Opts) -> Result<Self, LError> {
         let mut buf = src.split_to(20);
         if let Some(offset) = take_uvarint(&mut buf) {
             if let Some(length) = take_uvarint(&mut buf) {
@@ -76,14 +75,14 @@ impl Footer {
 }
 
 impl Encoding for Footer {
-    fn encode<C: Comparator>(&self, dst: &mut BytesMut, opts: &Opts<C>) -> usize {
+    fn encode(&self, dst: &mut BytesMut, opts: &Opts) -> usize {
         self.metaindex_handle.encode(dst, opts);
         self.index_handle.encode(dst, opts);
         dst.put_u64_le(self.magic);
         48
     }
 
-    fn decode<C: Comparator>(src: &mut Bytes, opts: &Opts<C>) -> Result<Self, LError> {
+    fn decode(src: &mut Bytes, opts: &Opts) -> Result<Self, LError> {
         if src.len() != FOOTER_SIZE {
             return Err(LError::InvalidFile(
                 "invalid footer: the size should be 48 bytes".into(),
@@ -103,10 +102,10 @@ impl Encoding for Footer {
     }
 }
 
-pub(crate) fn read_filter_data<C: Comparator, S: Storage>(
+pub(crate) fn read_filter_data<S: Storage>(
     file: &mut S,
     mut filter_meta_block: Bytes,
-    opt: &Opts<C>,
+    opt: &Opts,
 ) -> Result<Option<Filter>, LError> {
     let filter_name = match &opt.filter_name {
         None => return Ok(None),
@@ -160,7 +159,7 @@ impl From<Bytes> for FilterBlock {
 }
 
 impl Encoding for FilterBlock {
-    fn encode<C: Comparator>(&self, dst: &mut BytesMut, _opts: &Opts<C>) -> usize {
+    fn encode(&self, dst: &mut BytesMut, _opts: &Opts) -> usize {
         let chechsum = crc32(self.data.as_ref());
         dst.put_slice(self.data.as_ref());
         dst.put_u8(NO_COMPRESSION_BLOCK_TYPE);
@@ -168,7 +167,7 @@ impl Encoding for FilterBlock {
         self.data.len()
     }
 
-    fn decode<C: Comparator>(src: &mut Bytes, opts: &Opts<C>) -> Result<Self, LError> {
+    fn decode(src: &mut Bytes, opts: &Opts) -> Result<Self, LError> {
         if src.len() < 5 {
             Err(LError::InvalidFile("invalid filter block".into()))
         } else {
@@ -193,7 +192,7 @@ impl<T: Clone + Debug> Debug for DecodedBlock<T> {
 }
 
 impl<T: Encoding + Clone> Encoding for DecodedBlock<T> {
-    fn encode<C: Comparator>(&self, dst: &mut BytesMut, opts: &Opts<C>) -> usize {
+    fn encode(&self, dst: &mut BytesMut, opts: &Opts) -> usize {
         let d = {
             let mut buf = BytesMut::new();
             let mut restarts = vec![0u32];
@@ -226,7 +225,7 @@ impl<T: Encoding + Clone> Encoding for DecodedBlock<T> {
         data_size
     }
 
-    fn decode<C: Comparator>(src: &mut Bytes, opts: &Opts<C>) -> Result<Self, LError> {
+    fn decode(src: &mut Bytes, opts: &Opts) -> Result<Self, LError> {
         let mut block_data = split_block_tracer(src, opts)?;
         let block_len = block_data.len();
         let num_restarts = u32::from_le_bytes(
@@ -265,7 +264,7 @@ impl<T: Encoding + Clone> Encoding for DecodedBlock<T> {
     }
 }
 
-fn split_block_tracer<C: Comparator>(src: &mut Bytes, opts: &Opts<C>) -> Result<Bytes, LError> {
+fn split_block_tracer(src: &mut Bytes, opts: &Opts) -> Result<Bytes, LError> {
     let len = src.len();
     if len < 5 {
         return Err(LError::InvalidFile(
@@ -308,11 +307,10 @@ impl<T: Clone> DecodedBlock<T> {
         self.entries.iter().map(|x| x.len()).sum()
     }
 
-    pub fn search_value<C: Comparator>(&self, key: &[u8], opts: &Opts<C>) -> Result<T, Option<T>> {
+    pub fn search_value(&self, ukey: &[u8], opts: &Opts) -> Result<(Bytes, T), Option<T>> {
         let comparator = opts.get_comparator();
-        let uk = InternalKeyRef::from(key).ukey;
         let i = match self.entries.binary_search_by(|x| {
-            comparator.compare(InternalKeyRef::from(x.first.key_delta.as_ref()).ukey, uk)
+            comparator.compare(InternalKeyRef::from(x.first.key_delta.as_ref()).ukey, ukey)
         }) {
             Err(i) => {
                 if i == 0 {
@@ -322,10 +320,10 @@ impl<T: Clone> DecodedBlock<T> {
             }
             Ok(i) => i,
         };
-        self.entries[i].search_value(key, opts)
+        self.entries[i].search_value(ukey, opts)
     }
 
-    pub(crate) fn set<C: Comparator>(&mut self, key: Bytes, value: T, opts: &Opts<C>) {
+    pub(crate) fn set(&mut self, key: Bytes, value: T, opts: &Opts) {
         if let Some(e) = self.entries.last_mut() {
             if e.len() < opts.get_block_restart_interval() {
                 e.push_value(key, value, opts);
@@ -419,7 +417,7 @@ impl<T: Clone + Debug> Debug for Entry<T> {
 }
 
 impl<T: Encoding + Clone> Encoding for Entry<T> {
-    fn encode<C: Comparator>(&self, dst: &mut BytesMut, opts: &Opts<C>) -> usize {
+    fn encode(&self, dst: &mut BytesMut, opts: &Opts) -> usize {
         let mut value = BytesMut::new();
         let value_len = self.value.encode(&mut value, opts);
         let s = put_uvarint(dst, self.shared_bytes as u64)
@@ -432,7 +430,7 @@ impl<T: Encoding + Clone> Encoding for Entry<T> {
         s
     }
 
-    fn decode<C: Comparator>(src: &mut Bytes, opts: &Opts<C>) -> Result<Self, LError> {
+    fn decode(src: &mut Bytes, opts: &Opts) -> Result<Self, LError> {
         let shared_bytes =
             take_uvarint(src).ok_or(LError::InvalidFile("invalid shared_bytes".into()))? as u32;
         let unshared_bytes =
@@ -500,17 +498,17 @@ impl<T: Clone> EntryGroup<T> {
         }
     }
 
-    pub(crate) fn search_value<C: Comparator>(
-        &self,
-        key: &[u8],
-        opts: &Opts<C>,
-    ) -> Result<T, Option<T>> {
-        let ikr = InternalKeyRef::from(key);
+    pub(crate) fn search_value(&self, ukey: &[u8], opts: &Opts) -> Result<(Bytes, T), Option<T>> {
         let c = opts.get_comparator();
         let first_key = InternalKeyRef::from(self.first.key_delta.as_ref());
-        match c.compare(first_key.ukey, ikr.ukey) {
+        match c.compare(first_key.ukey, ukey) {
             Ordering::Less => {}
-            Ordering::Equal => return Ok(self.first.value.clone()),
+            Ordering::Equal => {
+                return Ok((
+                    self.first.key_delta.clone().into(),
+                    self.first.value.clone(),
+                ))
+            }
             Ordering::Greater => return Err(None),
         }
         let find_result = self.following.binary_search_by(|x| {
@@ -519,17 +517,22 @@ impl<T: Clone> EntryGroup<T> {
                 Ok(k) => k,
                 Err(_e) => return Ordering::Less,
             };
-            c.compare(ik.ukey(), ikr.ukey)
+            c.compare(ik.ukey(), ukey)
         });
 
         match find_result {
             Err(0) => Err(Some(self.first.value.clone())),
             Err(i) => Err(Some(self.following[i - 1].value.clone())),
-            Ok(i) => Ok(self.following[i].value.clone()),
+            Ok(i) => {
+                let key = self.following[i]
+                    .get_full_key(self.first.key_delta.as_ref())
+                    .clone();
+                Ok((key, self.following[i].value.clone()))
+            }
         }
     }
 
-    pub(crate) fn push_value<C: Comparator>(&mut self, mut key: Bytes, value: T, _opts: &Opts<C>) {
+    pub(crate) fn push_value(&mut self, mut key: Bytes, value: T, _opts: &Opts) {
         let shared_bytes = prefix_len(&self.first.key_delta, &key);
         let unshared_bytes = if key.len() > shared_bytes {
             key.len() - shared_bytes
@@ -562,7 +565,7 @@ fn prefix_len(left: &Bytes, right: &Bytes) -> usize {
 }
 
 impl<T: Encoding + Clone> Encoding for EntryGroup<T> {
-    fn encode<C: Comparator>(&self, dst: &mut BytesMut, opts: &Opts<C>) -> usize {
+    fn encode(&self, dst: &mut BytesMut, opts: &Opts) -> usize {
         self.first.encode(dst, opts)
             + self
                 .following
@@ -571,7 +574,7 @@ impl<T: Encoding + Clone> Encoding for EntryGroup<T> {
                 .sum::<usize>()
     }
 
-    fn decode<C: Comparator>(src: &mut Bytes, opts: &Opts<C>) -> Result<Self, LError> {
+    fn decode(src: &mut Bytes, opts: &Opts) -> Result<Self, LError> {
         let first: Entry<T> = Entry::decode(src, opts)?;
         let mut following = vec![];
         while !src.is_empty() {
@@ -594,10 +597,10 @@ pub(crate) struct Filter {
 }
 
 impl Filter {
-    pub(crate) fn from_sstable_block<C: Comparator>(
+    pub(crate) fn from_sstable_block(
         mut data: Bytes,
         policy: &'static BloomFilter,
-        opts: &Opts<C>,
+        opts: &Opts,
     ) -> Option<Self> {
         let mut data = match FilterBlock::decode(&mut data, opts) {
             Err(_) => return None,
@@ -633,8 +636,7 @@ impl Filter {
 
 #[cfg(test)]
 mod tests {
-    use crate::compare::BytewiseComparator;
-    use crate::key::InternalKeyRef;
+    use crate::key::{InternalKey, InternalKeyRef};
     use crate::opts::{Opts, OptsRaw};
     use crate::sstable::format::{
         BlockHandle, DecodedBlock, Encoding, Entry, EntryGroup, FilterBlock, Footer, IndexBlock,
@@ -644,7 +646,7 @@ mod tests {
 
     #[test]
     fn test_footer() {
-        let opts = Opts::<BytewiseComparator>::default();
+        let opts = Opts::default();
         let mut buf = BytesMut::new();
         let footer = Footer::new(BlockHandle::new(1, 2), BlockHandle::new(3, 4));
         footer.encode(&mut buf, &opts);
@@ -660,7 +662,7 @@ mod tests {
 
     #[test]
     fn test_block_handle() {
-        let opts = Opts::<BytewiseComparator>::default();
+        let opts = Opts::default();
         let mut buf = BytesMut::new();
         let bhs = vec![
             BlockHandle::new(1, 2),
@@ -681,18 +683,14 @@ mod tests {
 
     #[test]
     fn test_entry_group() {
-        let opts = Opts::<BytewiseComparator>::default();
-        let kvs: Vec<(Bytes, Bytes)> = (11..99)
+        let opts = Opts::default();
+        let kvs: Vec<(InternalKey, Bytes)> = (11..99)
             .map(|x| {
                 (
-                    InternalKeyRef::from((format!("key:{}", x).as_bytes(), x as u64))
-                        .to_owned()
-                        .borrow_inner()
-                        .clone(),
-                    format!("value:{}", x),
+                    InternalKeyRef::from((format!("key:{}", x).as_bytes(), x as u64)).to_owned(),
+                    format!("value:{}", x).into(),
                 )
             })
-            .map(|(k, v)| (Bytes::from(k), Bytes::from(v)))
             .collect();
         let mut eg = EntryGroup::new(Entry {
             shared_bytes: 0,
@@ -705,18 +703,19 @@ mod tests {
             full_key: OnceCell::new(),
         });
         for (k, v) in kvs.iter() {
-            eg.push_value(k.clone(), v.clone(), &opts);
+            eg.push_value(k.borrow_inner().clone(), v.clone(), &opts);
         }
         assert_eq!(eg.len(), 89);
-        let key = InternalKeyRef::from(("key:10".as_bytes(), 10)).to_owned();
+        let ukey = "key:10".as_bytes();
         assert_eq!(
-            eg.search_value(key.as_ref(), &opts),
+            eg.search_value(ukey.as_ref(), &opts).map(|(_, v)| v),
             Ok(Bytes::from("value:10".to_string()))
         );
         for i in 1..89 {
             assert_eq!(
-                eg.search_value(&kvs[i - 1].0.as_ref(), &opts),
-                Ok(kvs[i - 1].1.clone())
+                eg.search_value(&kvs[i - 1].0.ukey(), &opts)
+                    .map(|(ikb, v)| (InternalKey::try_from(ikb).unwrap(), v)),
+                Ok(kvs[i - 1].clone())
             )
         }
         let mut buf = BytesMut::new();
@@ -733,25 +732,30 @@ mod tests {
     fn test_decoded_block() {
         let opts = new_opt_with_checksum();
         let mut db: DecodedBlock<Bytes> = DecodedBlock::default();
-        let kvs: Vec<(Bytes, Bytes)> = (11..99)
+        let kvs: Vec<(InternalKey, Bytes)> = (11..99)
             .map(|x| {
                 (
-                    InternalKeyRef::from((format!("key:{}", x).as_bytes(), x as u64))
-                        .to_owned()
-                        .borrow_inner()
-                        .clone(),
+                    InternalKeyRef::from((format!("key:{}", x).as_bytes(), x as u64)).to_owned(),
                     format!("value:{}", x),
                 )
             })
             .map(|(k, v)| (k, Bytes::from(v)))
             .collect();
         for (k, v) in kvs.iter() {
-            db.set(k.clone(), v.clone(), &opts);
+            db.set(k.borrow_inner().clone(), v.clone(), &opts);
         }
         assert_eq!(db.len(), 88);
         for i in 0..88 {
-            assert_eq!(db.get_nth_entry(i), Some(kvs[i].clone()));
-            assert_eq!(db.search_value(&kvs[i].0, &opts), Ok(kvs[i].1.clone()));
+            assert_eq!(
+                db.get_nth_entry(i)
+                    .map(|(kk, v)| (InternalKey::try_from(kk).unwrap(), v)),
+                Some(kvs[i].clone())
+            );
+            assert_eq!(
+                db.search_value(&kvs[i].0.ukey(), &opts)
+                    .map(|(kk, v)| (InternalKey::try_from(kk).unwrap(), v)),
+                Ok(kvs[i].clone())
+            );
         }
         let mut buf = BytesMut::new();
         db.encode(&mut buf, &opts);
@@ -768,23 +772,23 @@ mod tests {
     fn test_index_block() {
         let opts = new_opt_with_checksum();
         let mut ib: IndexBlock = DecodedBlock::default();
-        let bhs: Vec<(Bytes, BlockHandle)> = (100..199)
+        let bhs: Vec<(InternalKey, BlockHandle)> = (100..199)
             .map(|x| {
                 (
-                    InternalKeyRef::from((format!("key:{}", x).as_bytes(), x as u64))
-                        .to_owned()
-                        .borrow_inner()
-                        .clone(),
+                    InternalKeyRef::from((format!("key:{}", x).as_bytes(), x as u64)).to_owned(),
                     BlockHandle::new(x as u64, x as u64),
                 )
             })
             .collect();
         for (key, bh) in bhs.iter() {
-            ib.set(key.clone(), bh.clone(), &opts);
+            ib.set(key.borrow_inner().clone(), bh.clone(), &opts);
         }
         for i in 0..99 {
             assert_eq!(ib.get_nth_block_handle(i), Some(bhs[i].1));
-            assert_eq!(ib.search_value(&bhs[i].0, &opts), Ok(bhs[i].1));
+            assert_eq!(
+                ib.search_value(&bhs[i].0.ukey(), &opts).map(|(_, bh)| bh),
+                Ok(bhs[i].1)
+            );
         }
         let mut buf = BytesMut::new();
         ib.encode(&mut buf, &opts);
@@ -809,8 +813,8 @@ mod tests {
         assert_eq!(fb2.data, fb.data);
     }
 
-    fn new_opt_with_checksum() -> Opts<BytewiseComparator> {
-        let mut optsr = OptsRaw::<BytewiseComparator>::default();
+    fn new_opt_with_checksum() -> Opts {
+        let mut optsr = OptsRaw::default();
         optsr.verify_checksum = true;
         Opts::new(optsr)
     }

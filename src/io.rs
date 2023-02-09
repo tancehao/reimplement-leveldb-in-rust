@@ -1,4 +1,3 @@
-use crate::compare::Comparator;
 use crate::opts::Opts;
 use crate::utils::call_on_drop::CallOnDrop;
 use crate::{call_on_drop, LError};
@@ -16,17 +15,17 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 pub(crate) trait Encoding: Sized {
-    fn encode<T: Comparator>(&self, dst: &mut BytesMut, opts: &Opts<T>) -> usize;
-    fn decode<T: Comparator>(src: &mut Bytes, opts: &Opts<T>) -> Result<Self, LError>;
+    fn encode(&self, dst: &mut BytesMut, opts: &Opts) -> usize;
+    fn decode(src: &mut Bytes, opts: &Opts) -> Result<Self, LError>;
 }
 
 impl Encoding for Bytes {
-    fn encode<C: Comparator>(&self, dst: &mut BytesMut, _opts: &Opts<C>) -> usize {
+    fn encode(&self, dst: &mut BytesMut, _opts: &Opts) -> usize {
         dst.put_slice(self.as_ref());
         self.len()
     }
 
-    fn decode<C: Comparator>(src: &mut Bytes, _opts: &Opts<C>) -> Result<Self, LError> {
+    fn decode(src: &mut Bytes, _opts: &Opts) -> Result<Self, LError> {
         Ok(src.split_to(src.len()))
     }
 }
@@ -234,12 +233,9 @@ impl StorageSystem for MemFS {
     type O = MemFile;
 
     fn open(&self, name: &str) -> Result<Self::O, LError> {
-        self.files
-            .lock()
-            .unwrap()
-            .get(name)
-            .map(|x| x.clone())
-            .ok_or(LError::Internal("not found".to_string()))
+        let mut files = self.files.lock().unwrap();
+        let a = files.entry(name.to_string()).or_insert(MemFile::new(Mutex::new((vec![], 0))));
+        Ok(a.clone())
     }
 
     fn pwd(&self) -> Result<String, LError> {
@@ -275,14 +271,24 @@ impl StorageSystem for MemFS {
         Ok(())
     }
 
-    fn list(&self, _dirname: &str) -> Result<Vec<String>, LError> {
-        Ok(self
-            .files
-            .lock()
-            .unwrap()
-            .keys()
-            .map(|x| x.clone())
-            .collect())
+    fn list(&self, dirname: &str) -> Result<Vec<String>, LError> {
+        let files = self.files.lock().unwrap();
+        let mut names = vec![];
+        let dirname = if dirname.starts_with("./") {
+            dirname.strip_prefix("./").unwrap().to_string()
+        } else {
+            dirname.to_string()
+        };
+        for mut k in files.iter().map(|(x, _)| x.clone()) {
+            if k.starts_with("./") {
+                k = k.strip_prefix("./").unwrap().to_string();
+            }
+            if k.starts_with(dirname.as_str()) {
+                let n = k.strip_prefix(format!("{}/", dirname).as_str()).unwrap_or_default().to_string();
+                names.push(n);
+            }
+        }
+        Ok(names)
     }
 
     fn exists(&self, name: &str) -> Result<bool, LError> {

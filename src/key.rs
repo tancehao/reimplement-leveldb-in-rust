@@ -1,4 +1,4 @@
-use crate::compare::Comparator;
+use crate::compare::{Comparator, ComparatorImpl};
 use crate::key::InternalKeyKind::{Delete, Set};
 use crate::LError;
 use bytes::{BufMut, Bytes, BytesMut};
@@ -119,6 +119,10 @@ impl InternalKey {
         }
     }
 
+    pub(crate) fn is_set(&self) -> bool {
+        self.kind() == Set
+    }
+
     pub(crate) fn seq_num(&self) -> u64 {
         let sk = u64::from_le_bytes(
             self.0.as_ref()[self.0.len() - 8..]
@@ -148,11 +152,11 @@ impl Default for InternalKeyKind {
 }
 
 #[derive(Copy, Clone, Debug)]
-pub struct InternalKeyComparator<C: Comparator> {
-    u: C,
+pub struct InternalKeyComparator {
+    u: ComparatorImpl,
 }
 
-impl<C: Comparator> Comparator for InternalKeyComparator<C> {
+impl Comparator for InternalKeyComparator {
     fn compare(&self, a: &[u8], b: &[u8]) -> Ordering {
         if a.len() < 8 || b.len() < 8 {
             panic!("invalid internal keys for comparing")
@@ -167,13 +171,13 @@ impl<C: Comparator> Comparator for InternalKeyComparator<C> {
     }
 }
 
-impl<C: Comparator> From<C> for InternalKeyComparator<C> {
-    fn from(u: C) -> Self {
+impl From<ComparatorImpl> for InternalKeyComparator {
+    fn from(u: ComparatorImpl) -> Self {
         Self { u }
     }
 }
 
-impl<C: Comparator> InternalKeyComparator<C> {
+impl InternalKeyComparator {
     pub(crate) fn compare_keyref(&self, a: &InternalKeyRef, b: &InternalKeyRef) -> Ordering {
         match self.u.compare(a.ukey, b.ukey) {
             Ordering::Equal => match a.seq_num.cmp(&b.seq_num) {
@@ -195,7 +199,7 @@ impl<C: Comparator> InternalKeyComparator<C> {
 
 #[cfg(test)]
 mod test {
-    use crate::compare::BytewiseComparator;
+    use crate::compare::BYTEWISE_COMPARATOR;
     use crate::key::{InternalKeyComparator, InternalKeyKind, InternalKeyRef};
     use bytes::Bytes;
     use std::cmp::Ordering;
@@ -217,8 +221,7 @@ mod test {
             .iter()
             .map(|(k, n)| InternalKeyRef::from((k.as_ref(), *n)))
             .collect::<Vec<InternalKeyRef>>();
-        let c = BytewiseComparator::default();
-        let ic = InternalKeyComparator::from(c);
+        let ic = InternalKeyComparator::from(BYTEWISE_COMPARATOR);
         for i in 0..key_nums.len() {
             assert_eq!(key_nums[i].0.as_ref(), ikeys[i].ukey);
             assert_eq!(key_nums[i].1, ikeys[i].seq_num);

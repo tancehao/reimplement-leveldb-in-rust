@@ -1,4 +1,4 @@
-use crate::compare::Comparator;
+use crate::compare::ComparatorImpl;
 use crate::memtable::MemTable;
 use bytes::Bytes;
 
@@ -18,7 +18,7 @@ impl MemTable for SkipList {
         todo!()
     }
 
-    fn get(&self, _key: &[u8]) -> Option<Bytes> {
+    fn get(&self, _key: &[u8]) -> Option<Option<Bytes>> {
         todo!()
     }
 
@@ -30,7 +30,11 @@ impl MemTable for SkipList {
         todo!()
     }
 
-    fn iter<C: Comparator>(&self, _c: C) -> Box<dyn Iterator<Item = (Bytes, u64, Option<Bytes>)>> {
+    fn last_seq_num(&self) -> u64 {
+        todo!()
+    }
+
+    fn iter(&self, _c: ComparatorImpl) -> Box<dyn Iterator<Item = (Bytes, u64, Option<Bytes>)>> {
         todo!()
     }
 }

@@ -1,4 +1,3 @@
-use crate::compare::Comparator;
 use crate::db::DBScanner;
 use crate::io::{Encoding, Storage};
 use crate::key::InternalKey;
@@ -10,10 +9,12 @@ use crate::sstable::format::{
 };
 use crate::LError;
 use bytes::Bytes;
-use linked_hash_map_rs::LinkedHashMap;
 use std::fmt::{Debug, Formatter};
 use std::sync::Arc;
 use std::sync::Mutex;
+use crate::utils::lru::{CacheSize, LRUCache};
+
+pub(crate) type SSTEntry = (InternalKey, Bytes);
 
 // TODO: make it private
 pub struct SSTableReader<S: Storage> {
@@ -47,7 +48,7 @@ impl<S: Storage> Debug for SSTableReader<S> {
 }
 
 impl<S: Storage> SSTableReader<S> {
-    pub fn open<C: Comparator>(mut file: S, num: u64, opts: &Opts<C>) -> Result<Self, LError> {
+    pub fn open(mut file: S, num: u64, opts: &Opts) -> Result<Self, LError> {
         let size = file.size()? as usize;
         let mut footer_raw = [0u8; FOOTER_SIZE];
         if size < footer_raw.len() {
@@ -75,18 +76,18 @@ impl<S: Storage> SSTableReader<S> {
         self.shared_cache = cache;
     }
 
-    pub(crate) fn load_block<C: Comparator>(
+    pub(crate) fn load_block(
         &self,
         handle: BlockHandle,
-        opt: &Opts<C>,
+        opt: &Opts,
     ) -> Result<DataBlockPtr, LError> {
-        if let Some(v) = self.shared_cache.lock()?.get(self.num, handle) {
-            return Ok(v);
+        if let Some(v) = self.shared_cache.lock()?.get(&(self.num, handle)) {
+            return Ok(v.clone());
         }
         let mut file = self.f.lock()?;
         // we should query the cache again, because this method may be concurrently called
-        if let Some(v) = self.shared_cache.lock()?.get(self.num, handle) {
-            return Ok(v);
+        if let Some(v) = self.shared_cache.lock()?.get(&(self.num, handle)) {
+            return Ok(v.clone());
         }
 
         // load from the file actually
@@ -98,38 +99,41 @@ impl<S: Storage> SSTableReader<S> {
             Ok(d) => d,
         };
         let db = Arc::new(DataBlock::decode(&mut d, opt)?);
-        self.shared_cache.lock()?.set(self.num, handle, db.clone());
+        self.shared_cache.lock()?.set((self.num, handle), db.clone());
         Ok(db)
     }
 
-    pub(crate) fn get<C: Comparator>(
-        &self,
-        key: &[u8],
-        opts: &Opts<C>,
-    ) -> Result<Option<Bytes>, LError> {
+    pub(crate) fn get(&self, ukey: &[u8], opts: &Opts) -> Result<Option<SSTEntry>, LError> {
         if let Some(_f) = self.filter.as_ref() {
             // TODO need to use bloom filter
         }
-        let block_handle = match self.index.search_value(key, opts) {
-            Ok(bh) => bh,
+        let block_handle = match self.index.search_value(ukey, opts) {
+            Ok((_, bh)) => bh,
             Err(Some(bh)) => bh,
             Err(None) => return Ok(None),
         };
-        match self.load_block(block_handle, opts)?.search_value(key, opts) {
-            Ok(val) => Ok(Some(val)),
+        let r = self
+            .load_block(block_handle, opts)?
+            .search_value(ukey, opts);
+        match r
+        {
+            Ok((key, val)) => {
+                let ik = InternalKey::try_from(key)?;
+                Ok(Some((ik, val)))
+            }
             _ => Ok(None),
         }
     }
 }
 
-pub struct SSTableScanner<C: Comparator, S: Storage> {
+pub struct SSTableScanner<S: Storage> {
     reader: SSTableReader<S>,
-    opts: Opts<C>,
+    opts: Opts,
     current_index: usize,
     current_entry: usize,
 }
-impl<C: Comparator, S: Storage> SSTableScanner<C, S> {
-    pub fn new(reader: SSTableReader<S>, opts: Opts<C>) -> Self {
+impl<S: Storage> SSTableScanner<S> {
+    pub fn new(reader: SSTableReader<S>, opts: Opts) -> Self {
         Self {
             reader,
             opts,
@@ -139,8 +143,8 @@ impl<C: Comparator, S: Storage> SSTableScanner<C, S> {
     }
 }
 
-impl<C: Comparator, S: Storage> DBScanner for SSTableScanner<C, S> {
-    fn next(&mut self) -> Result<Option<(InternalKey, Bytes)>, LError> {
+impl<S: Storage> DBScanner for SSTableScanner<S> {
+    fn next(&mut self) -> Result<Option<SSTEntry>, LError> {
         loop {
             match self.reader.index.get_nth_block_handle(self.current_index) {
                 None => return Ok(None),
@@ -168,62 +172,16 @@ impl<C: Comparator, S: Storage> DBScanner for SSTableScanner<C, S> {
     }
 }
 
-pub(crate) type BlockCache = Arc<Mutex<LRUCache>>;
-
-// TODO adapt for generic types
-#[derive(Default)]
-pub(crate) struct LRUCache {
-    cache: LinkedHashMap<(u64, BlockHandle), Arc<DataBlock>>,
-    size: usize,
-    size_limit: usize,
-}
-
-impl LRUCache {
-    pub fn new(size_limit: usize) -> Arc<Mutex<Self>> {
-        Arc::new(Mutex::new(Self {
-            cache: LinkedHashMap::new(),
-            size_limit,
-            size: 0,
-        }))
-    }
-
-    pub fn size(&self) -> usize {
-        self.size
-    }
-
-    pub fn limit(&self) -> usize {
-        self.size_limit
-    }
-
-    pub fn len(&self) -> usize {
-        self.cache.len()
-    }
-
-    pub fn get(&mut self, file_number: u64, bh: BlockHandle) -> Option<Arc<DataBlock>> {
-        self.cache
-            .move_to_back(&(file_number, bh))
-            .map(|(_, db)| db.clone())
-    }
-
-    pub fn set(&mut self, file_number: u64, bh: BlockHandle, db: Arc<DataBlock>) {
-        let key = (file_number, bh);
-        let size = match self.cache.get(&key) {
-            None => 0,
-            Some(v) => {
-                let s = v.size();
-                self.cache.remove(&key);
-                s
-            }
-        };
-        self.size = self.size - size + db.size();
-        self.cache.push_back(key, db);
-        while self.size > self.size_limit {
-            match self.cache.pop_front() {
-                None => break,
-                Some((_, db)) => {
-                    self.size -= db.size();
-                }
-            }
-        }
+impl CacheSize for (u64, BlockHandle) {
+    fn appropriate_size(&self) -> usize {
+        24
     }
 }
+
+impl CacheSize for DataBlockPtr {
+    fn appropriate_size(&self) -> usize {
+        self.size()
+    }
+}
+
+pub(crate) type BlockCache = Arc<Mutex<LRUCache<(u64, BlockHandle), DataBlockPtr>>>;

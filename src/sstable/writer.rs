@@ -1,4 +1,3 @@
-use crate::compare::Comparator;
 use crate::filter::{BloomFilter, FilterPolicy, BLOOM_FILTER};
 use crate::io::{Encoding, Storage};
 use crate::key::InternalKey;
@@ -9,11 +8,12 @@ use crate::LError;
 use bytes::{BufMut, Bytes, BytesMut};
 use std::cmp::Ordering;
 use std::sync::{Arc, Mutex};
+use crate::utils::lru::LRUCache;
 
-pub struct SSTableWriter<C: Comparator, S: Storage> {
+pub struct SSTableWriter<S: Storage> {
     num: u64,
     file: S,
-    opts: Opts<C>,
+    opts: Opts,
     wrote_size: u64,
     last_key: Option<InternalKey>,
     data_block: DataBlock,
@@ -24,8 +24,8 @@ pub struct SSTableWriter<C: Comparator, S: Storage> {
     finish: bool,
 }
 
-impl<C: Comparator, S: Storage> SSTableWriter<C, S> {
-    pub(crate) fn new(num: u64, file: S, opts: Opts<C>) -> Self {
+impl<S: Storage> SSTableWriter<S> {
+    pub(crate) fn new(num: u64, file: S, opts: Opts) -> Self {
         Self {
             num,
             file,
@@ -153,7 +153,7 @@ impl<C: Comparator, S: Storage> SSTableWriter<C, S> {
         Ok(SSTableReader {
             num: self.num,
             f: Arc::new(Mutex::new(self.file)),
-            shared_cache: Arc::new(Mutex::new(Default::default())),
+            shared_cache: LRUCache::new(0),
             index: self.index_block,
             filter: filter,
         })

@@ -1,10 +1,11 @@
 pub mod format;
 pub mod reader;
 pub mod writer;
+pub mod metric;
 
 #[cfg(test)]
 mod test {
-    use crate::compare::{BytewiseComparator, Comparator};
+    use crate::compare::Comparator;
     use crate::db::DBScanner;
     use crate::io::{MemFS, StorageSystem};
     use crate::key::{InternalKey, InternalKeyComparator, InternalKeyRef};
@@ -22,7 +23,7 @@ mod test {
     }
 
     fn write_and_read() -> Result<(), LError> {
-        let mut opt_raw: OptsRaw<BytewiseComparator> = OptsRaw::default();
+        let mut opt_raw: OptsRaw = OptsRaw::default();
         opt_raw.block_size = 10240;
         let opt = Opts::new(opt_raw);
         let fs = MemFS::default();
@@ -47,7 +48,7 @@ mod test {
         let file = fs.open("sstable")?;
         let reader = SSTableReader::open(file, 1, &opt)?;
         for (k, v) in kvs_map.iter() {
-            assert_eq!(reader.get(k.as_ref(), &opt)?, Some(v.clone()));
+            assert_eq!(reader.get(k.ukey(), &opt)?, Some((k.clone(), v.clone())));
         }
         let mut scanner = SSTableScanner::new(reader, opt.clone());
         for (k, v) in kvs_list.iter() {

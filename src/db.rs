@@ -1,5 +1,5 @@
 use crate::batch::Batch;
-use crate::compare::Comparator;
+use crate::compare::{Comparator, ComparatorImpl};
 use crate::filename::{db_filename, parse_dbname, set_current_file, FileType};
 use crate::io::{Encoding, Storage, StorageSystem};
 use crate::key::{InternalKey, InternalKeyComparator, InternalKeyRef};
@@ -16,28 +16,31 @@ use std::collections::{HashSet, VecDeque};
 use std::ops::Deref;
 use std::path::Path;
 use std::sync::{Arc, Mutex, RwLock};
+use std::sync::atomic::Ordering::Relaxed;
 use std::time::Duration;
+use crate::sstable::metric::Metric;
 
-pub struct DB<C: Comparator, S: Storage, M: MemTable> {
+pub struct DB<S: Storage, M: MemTable> {
     pub(crate) dirname: String,
-    pub(crate) opts: Opts<C>,
-    pub(crate) ucmp: C,
-    pub(crate) icmp: InternalKeyComparator<C>,
-    pub(crate) inner: Arc<Mutex<DBInner<C, S, M>>>,
+    pub(crate) opts: Opts,
+    pub(crate) ucmp: ComparatorImpl,
+    pub(crate) icmp: InternalKeyComparator,
+    pub(crate) inner: Arc<Mutex<DBInner<S, M>>>,
     #[allow(unused)]
     pub(crate) file_lock: Arc<Mutex<Box<dyn Send>>>,
     pub(crate) compactioning: Arc<RwLock<()>>,
     pub(crate) bgwork_trigger: Sender<BGWorkTask>,
+    pub(crate) metric: Metric,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub(crate) enum BGWorkTask {
     Compaction,
-    CleanSST(u64),
+    TryCleanSSTs(Vec<u64>),
     CleanWAL(u64),
 }
 
-impl<C: Comparator, S: Storage, M: MemTable> Clone for DB<C, S, M> {
+impl<S: Storage, M: MemTable> Clone for DB<S, M> {
     fn clone(&self) -> Self {
         Self {
             dirname: self.dirname.clone(),
@@ -48,13 +51,16 @@ impl<C: Comparator, S: Storage, M: MemTable> Clone for DB<C, S, M> {
             file_lock: Arc::new(Mutex::new(Box::new(vec![0]))),
             compactioning: self.compactioning.clone(),
             bgwork_trigger: self.bgwork_trigger.clone(),
+            metric: Metric::default()
         }
     }
 }
 
 pub(crate) struct MemDB<M: MemTable, S: Storage> {
     mem: M,
-    wal: Option<Wal<S>>,
+    file_num: u64,
+    wal: Option<Arc<Mutex<(WalWriter<S>, i64)>>>,
+    batch_buf: Arc<Mutex<VecDeque<Batch>>>,
 }
 
 impl<M: MemTable, S: Storage> Deref for MemDB<M, S> {
@@ -66,38 +72,42 @@ impl<M: MemTable, S: Storage> Deref for MemDB<M, S> {
 }
 
 impl<M: MemTable, S: Storage> MemDB<M, S> {
-    pub(crate) fn wal_log_num(&self) -> Option<u64> {
-        self.wal.as_ref().map(|x| x.file_num)
+    pub(crate) fn wal_log_num(&self) -> u64 {
+        self.file_num
     }
-}
 
-pub(crate) struct Wal<S: Storage> {
-    writer: Arc<Mutex<WalWriter<S>>>,
-    file_num: u64,
-    buf: Arc<Mutex<VecDeque<Arc<Batch>>>>,
-}
-
-impl<S: Storage> Wal<S> {
-    pub(crate) fn new(writer: Arc<Mutex<WalWriter<S>>>, file_num: u64) -> Self {
-        Self {
-            writer,
-            file_num,
-            buf: Arc::new(Mutex::new(VecDeque::new())),
+    fn catch_up_with_wal(&mut self) -> Result<(), LError> {
+        let mut buf = self.batch_buf.lock()?;
+        loop {
+            match buf.pop_front() {
+                None => return Ok(()),
+                Some(batch) => if !batch.get_wal_written() {
+                    buf.push_front(batch);
+                    return Ok(());
+                } else {
+                    for (seq_num, k, v) in batch.iter() {
+                        match v {
+                            Some(val) => self.mem.set(k.clone(), seq_num, val.clone()),
+                            None => self.mem.del(k.clone(), seq_num),
+                        }
+                    }
+                }
+            }
         }
     }
 }
 
-pub(crate) struct DBInner<C: Comparator, S: Storage, M: MemTable> {
-    pub(crate) versions: VersionSet<C, S>,
+pub(crate) struct DBInner<S: Storage, M: MemTable> {
+    pub(crate) versions: VersionSet<S>,
     pub(crate) memdb: MemDB<M, S>,
     pub(crate) imem: Option<Arc<MemDB<M, S>>>,
     pub(crate) pending_outputs: HashSet<u64>,
 }
 
-impl<C: Comparator, S: Storage, M: MemTable> DB<C, S, M> {
+impl<S: Storage, M: MemTable> DB<S, M> {
     pub fn open(
         dirname: String,
-        opts: Opts<C>,
+        opts: Opts,
         fs: &'static dyn StorageSystem<O = S>,
     ) -> Result<Self, LError> {
         let dirname = if dirname.starts_with("/") {
@@ -108,6 +118,7 @@ impl<C: Comparator, S: Storage, M: MemTable> DB<C, S, M> {
         fs.mkdir_all(dirname.as_str())?;
         let file_lock = fs.lock(db_filename(dirname.as_str(), FileType::Lock).as_str())?;
         let (bgwork_tx, bgwork_rx) = unbounded();
+        let metric = Metric::default();
         let db = Self {
             dirname: dirname.clone(),
             opts: opts.clone(),
@@ -120,21 +131,25 @@ impl<C: Comparator, S: Storage, M: MemTable> DB<C, S, M> {
                     bgwork_tx.clone(),
                     opts.clone(),
                     fs.clone(),
+                    metric.clone(),
                 ),
                 memdb: MemDB {
                     mem: M::empty(),
+                    file_num: 0,
                     wal: None,
+                    batch_buf: Arc::new(Mutex::new(Default::default())),
                 },
                 imem: None,
                 pending_outputs: Default::default(),
             })),
             file_lock: Arc::new(Mutex::new(file_lock)),
             bgwork_trigger: bgwork_tx.clone(),
+            metric,
         };
 
         let mut inner = db.inner.lock()?;
         inner.versions =
-            VersionSet::new(dirname.clone(), bgwork_tx.clone(), opts.clone(), fs.clone());
+            VersionSet::new(dirname.clone(), bgwork_tx.clone(), opts.clone(), fs.clone(), db.metric.clone());
 
         let current_name = db_filename(dirname.as_str(), FileType::Current);
 
@@ -177,25 +192,26 @@ impl<C: Comparator, S: Storage, M: MemTable> DB<C, S, M> {
         }
         let log_number = inner.versions.incr_file_number();
         let wal_name = db_filename(dirname.as_str(), FileType::WAL(log_number));
-        let ww = Arc::new(Mutex::new(WalWriter::new(fs.create(wal_name.as_str())?)));
-        inner.memdb.wal = Some(Wal::new(ww, log_number));
+        inner.memdb.wal = Some(Arc::new(Mutex::new((WalWriter::new(fs.create(wal_name.as_str())?), -1))));
         drop(inner);
         db.start_bgwork(bgwork_rx);
         Ok(db)
     }
 
-    fn replay_wal(&self, mut reader: WalReader<S>, opts: &Opts<C>) -> Result<u64, LError> {
+    fn replay_wal(&self, mut reader: WalReader<S>, opts: &Opts) -> Result<u64, LError> {
         let mut inner = self.inner.lock()?;
         let mut max_seq_num = 0;
         while let Some(log) = reader.next()? {
             let mut d = Bytes::from(log);
-            let batch = Batch::decode(&mut d, &opts)?;
-            for (seq_num, k, v) in batch.iter() {
-                match v {
-                    Some(value) => inner.memdb.mem.set(k.clone(), seq_num, value.clone()),
-                    None => inner.memdb.mem.del(k.clone(), seq_num),
+            while !d.is_empty() {
+                let batch = Batch::decode(&mut d, &opts)?;
+                for (seq_num, k, v) in batch.iter() {
+                    match v {
+                        Some(value) => inner.memdb.mem.set(k.clone(), seq_num, value.clone()),
+                        None => inner.memdb.mem.del(k.clone(), seq_num),
+                    }
+                    max_seq_num = max(max_seq_num, seq_num);
                 }
-                max_seq_num = max(max_seq_num, seq_num);
             }
         }
         drop(inner);
@@ -204,16 +220,19 @@ impl<C: Comparator, S: Storage, M: MemTable> DB<C, S, M> {
     }
 
     fn start_bgwork(&self, rx: Receiver<BGWorkTask>) {
-        let handler = |db: &DB<C, S, M>, t: BGWorkTask| -> Result<(), LError> {
+        let handler = |db: &DB<S, M>, t: BGWorkTask| -> Result<(), LError> {
             match t {
                 BGWorkTask::Compaction => {
                     db.compact()?;
                 }
-                // FIXME should ensure the file is not contained in current version
-                BGWorkTask::CleanSST(num) => {
-                    let table_name = db_filename(db.dirname.as_str(), FileType::Table(num));
-                    let fs = db.inner.lock()?.versions.fs.clone();
-                    fs.remove(table_name.as_str())?;
+                BGWorkTask::TryCleanSSTs(nums) => {
+                    let live_files = db.inner.lock()?.versions.current_version().all_file_nums();
+                    let nums = nums.iter().filter(|x| live_files.get(x).is_none());
+                    for num in nums {
+                        let table_name = db_filename(db.dirname.as_str(), FileType::Table(*num));
+                        let fs = db.inner.lock()?.versions.fs.clone();
+                        fs.remove(table_name.as_str())?;
+                    }
                 }
                 BGWorkTask::CleanWAL(log_num) => {
                     let fs = db.inner.lock()?.versions.fs.clone();
@@ -242,12 +261,15 @@ impl<C: Comparator, S: Storage, M: MemTable> DB<C, S, M> {
             Ok(())
         };
         let db = self.clone();
+        let metric = self.metric.clone();
         std::thread::spawn(move || {
+            metric.threads.fetch_add(1, Relaxed);
             for t in rx {
                 if let Err(e) = handler(&db, t) {
                     println!("error occurred when handling bg works: {:?}", e);
                 }
             }
+            metric.threads.fetch_sub(1, Relaxed);
         });
     }
 
@@ -284,12 +306,21 @@ impl<C: Comparator, S: Storage, M: MemTable> DB<C, S, M> {
             let new_wal_writer = WalWriter::new(new_wal_file);
             let new_memdb = MemDB {
                 mem: M::empty(),
-                wal: Some(Wal::new(
-                    Arc::new(Mutex::new(new_wal_writer)),
-                    new_log_number,
-                )),
+                file_num: new_log_number,
+                wal: Some(Arc::new(Mutex::new((new_wal_writer, -1)))),
+                batch_buf: inner.memdb.batch_buf.clone(),
             };
-            inner.imem = Some(Arc::new(std::mem::replace(&mut inner.memdb, new_memdb)));
+            // somebody may be holding a pointer of the wal and writing logs into it, and we cannot
+            // replace the memdb now otherwise the logs are written to an old WAL while inserted into
+            // a new mem store. So we must hold a lock before doing the replace
+            let mut old_memdb = std::mem::replace(&mut inner.memdb, new_memdb);
+            if let Some(wal) = old_memdb.wal.as_ref() {
+                let wal_seq_num = wal.lock()?.1;
+                if  wal_seq_num > 0 && old_memdb.mem.last_seq_num() < wal_seq_num as u64 {
+                    old_memdb.catch_up_with_wal()?;
+                }
+            }
+            inner.imem = Some(Arc::new(old_memdb));
             inner.versions.log_number = new_log_number;
             force = false;
             self.maybe_schedule_compaction();
@@ -312,7 +343,8 @@ impl<C: Comparator, S: Storage, M: MemTable> DB<C, S, M> {
         }
         ve.next_file_number = inner.versions.next_file_number;
         ve.last_sequence = inner.versions.last_sequence;
-        let new_version = inner.versions.current_version().edit(ve);
+        let new_version = inner.versions.current_version().edit(ve, self.icmp);
+
         let manifest_number = inner.versions.manifest_file_number;
         let fs = inner.versions.fs.clone();
         let manifest_file = inner.versions.manifest_file.clone();
@@ -354,22 +386,25 @@ impl<C: Comparator, S: Storage, M: MemTable> DB<C, S, M> {
 }
 
 // exported methods
-impl<C: Comparator, O: Storage, M: MemTable> DB<C, O, M> {
+impl<O: Storage, M: MemTable> DB<O, M> {
     pub fn get(&self, key: &[u8]) -> Result<Option<Bytes>, LError> {
         let (ikey, version) = {
             let l = self.inner.lock()?;
             let ikey = InternalKeyRef::from((key, l.versions.last_sequence()));
             if let Some(v) = l.memdb.get(key) {
-                return Ok(Some(v));
+                return Ok(v);
             }
             if let Some(im) = &l.imem {
                 if let Some(v) = im.get(key) {
-                    return Ok(Some(v));
+                    return Ok(v);
                 }
             }
             (ikey, l.versions.current_version_cloned())
         };
-        version.get(ikey, &self.opts)
+        match version.get(ikey, &self.opts)? {
+            Some((k, v)) => Ok(k.is_set().then_some(v)),
+            None => Ok(None),
+        }
     }
 
     pub fn del(&self, key: Bytes) -> Result<(), LError> {
@@ -407,9 +442,8 @@ impl<C: Comparator, O: Storage, M: MemTable> DB<C, O, M> {
         writeln!(info, "exists={}", inner.imem.is_some())?;
         writeln!(info, "[WAL]")?;
         writeln!(info, "exists={}", inner.memdb.wal.is_some())?;
-        if let Some(n) = inner.memdb.wal_log_num() {
-            writeln!(info, "num={}", n)?;
-        }
+        writeln!(info, "num={}", inner.memdb.wal_log_num())?;
+
         writeln!(info, "[VERSIONS]")?;
         writeln!(info, "last_sequence={}", inner.versions.last_sequence())?;
         writeln!(
@@ -424,54 +458,64 @@ impl<C: Comparator, O: Storage, M: MemTable> DB<C, O, M> {
         writeln!(info, "len={}", inner.versions.block_cache.lock()?.len())?;
         writeln!(info, "[PendingOutputs]")?;
         writeln!(info, "{:?}", inner.pending_outputs)?;
+        writeln!(info, "[System]")?;
+        // TODO
+        writeln!(info, "threads={}", self.metric.threads.load(Relaxed))?;
+        writeln!(info, "memory={}", 0)?;
         Ok(info)
     }
 
     pub fn apply(&self, mut batch: Batch) -> Result<(), LError> {
         self.make_room_for_write(false)?;
+
         let mut inner = self.inner.lock()?;
-        batch.set_seq_num(inner.versions.last_sequence() + 1);
+        let memdb_num = inner.memdb.file_num;
+        let batch_buf = inner.memdb.batch_buf.clone();
+        let wal = inner.memdb.wal.clone();
+        let seq_num = inner.versions.last_sequence() + 1;
+        batch.set_seq_num(seq_num);
         inner.versions.advance_last_sequence(batch.count() as u64);
-        let batch_ptr = Arc::new(batch);
-        // batch.encode(&mut log, &self.opts);
-
-        // we're going to write wal and it may block.
-        // release the lock and acquire it again later
-        if let Some(wal) = inner.memdb.wal.as_mut() {
-            let flush_wal = self.opts.get_flush_wal();
-            wal.buf.lock()?.push_back(batch_ptr.clone());
-            let (writer, buf) = (wal.writer.clone(), wal.buf.clone());
-            // now we drop the `inner` lock and other threads having entered this method
-            // may be able to acquire it and push their Batch to the buf queue. And the thread
-            // who acquire the `writer` lock later is able to write all these buffered batches
-            // to WAL file in a single write and flush.
-            drop(inner);
-            let mut ww = writer.lock()?;
-            let mut buf = buf.lock()?;
+        drop(inner);
+        batch_buf.lock()?.push_back(batch.clone());
+        let mut max_seq_num = 0u64;
+        if let Some(wal) = wal {
+            let mut wal_writer = wal.lock()?;
+            let mut buf = batch_buf.lock()?;
             let mut log = BytesMut::new();
-            while let Some(b) = buf.pop_front() {
-                b.encode(&mut log, &self.opts);
+            for batch in buf.iter_mut() {
+                if batch.get_wal_written() || batch.get_wal_buffered() {
+                    continue;
+                }
+                // TODO stop encoding a batch if the log's length is greater than BLOCK_SIZE
+                batch.encode(&mut log, &self.opts);
+                batch.set_wal_buffered();
+                max_seq_num = max(max_seq_num, batch.get_seq_num());
             }
-            ww.append(log.as_ref())?;
-            if flush_wal {
-                ww.flush()?;
+            wal_writer.0.append(log.as_ref())?;
+            if self.opts.get_flush_wal() {
+                wal_writer.0.flush()?;
             }
-            drop(ww);
+            for batch in buf.iter_mut() {
+                if batch.get_wal_buffered() {
+                    batch.set_wal_written();
+                }
+            }
+            wal_writer.1 = max(max_seq_num as i64, wal_writer.1);
+            drop(wal_writer);
             drop(buf);
-            inner = self.inner.lock()?;
         }
-
-        for (seq_num, k, v) in batch_ptr.iter() {
-            match v {
-                Some(val) => inner.memdb.mem.set(k.clone(), seq_num, val.clone()),
-                None => inner.memdb.mem.del(k.clone(), seq_num),
-            }
+        inner = self.inner.lock()?;
+        // the memdb has been converted to the imutual one when we were writing into WAL, and we should not
+        // insert the values into the newly opened memdb. Dont worry about data loss because the one who
+        // did the convertion has done the pending insertion.
+        if inner.memdb.file_num != memdb_num {
+            return Ok(())
         }
-        Ok(())
+        inner.memdb.catch_up_with_wal()
     }
 
     #[allow(unused)]
-    pub fn snapshot(&self) -> Result<Snapshot<C, O, M>, LError> {
+    pub fn snapshot(&self) -> Result<Snapshot<O, M>, LError> {
         Err(LError::Internal("unimplemented".into()))
     }
 
@@ -504,9 +548,9 @@ pub enum EventType {
 }
 
 #[allow(unused)]
-pub struct Snapshot<C: Comparator, O: Storage, M: MemTable> {
+pub struct Snapshot<O: Storage, M: MemTable> {
     seq_num: u64,
-    db: DB<C, O, M>,
+    db: DB<O, M>,
 }
 
 pub trait DBScanner {
@@ -539,12 +583,12 @@ impl<'a> From<Vec<Box<dyn DBScanner + 'a>>> for ConcatScanner<'a> {
     }
 }
 
-pub(crate) struct MergeScanner<'a, V: Comparator + 'a> {
+pub(crate) struct MergeScanner<'a> {
     scanners: Vec<(Box<dyn DBScanner + 'a>, Option<(InternalKey, Bytes)>)>,
-    cmp: V,
+    cmp: InternalKeyComparator,
 }
 
-impl<'a, V: Comparator + 'a> DBScanner for MergeScanner<'a, V> {
+impl<'a> DBScanner for MergeScanner<'a> {
     fn next(&mut self) -> Result<Option<(InternalKey, Bytes)>, LError> {
         if self.scanners.is_empty() {
             return Ok(None);
@@ -588,8 +632,8 @@ impl<'a, V: Comparator + 'a> DBScanner for MergeScanner<'a, V> {
     }
 }
 
-impl<'a, C: Comparator> MergeScanner<'a, C> {
-    pub(crate) fn new(cmp: C, scanners: Vec<Box<dyn DBScanner + 'a>>) -> Self {
+impl<'a> MergeScanner<'a> {
+    pub(crate) fn new(cmp: InternalKeyComparator, scanners: Vec<Box<dyn DBScanner + 'a>>) -> Self {
         Self {
             cmp,
             scanners: scanners.into_iter().map(|x| (x, None)).collect(),
@@ -599,6 +643,51 @@ impl<'a, C: Comparator> MergeScanner<'a, C> {
 
 #[cfg(test)]
 mod test {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use bytes::Bytes;
+    use lazy_static::lazy_static;
+    use crate::db::DB;
+    use crate::io::{MemFile, StorageSystem, MemFS};
+    use crate::key::InternalKeyRef;
+    use crate::memtable::simple::BTMap;
+    use crate::opts::OptsRaw;
+
+    #[test]
+    fn test_reopen_db() {
+        let mut opt_raw: OptsRaw = OptsRaw::default();
+        opt_raw.write_buffer_size = 256;
+        opt_raw.block_size = 512;
+        opt_raw.max_file_size = 4096;
+        opt_raw.flush_wal = true;
+        let opts = Arc::new(opt_raw);
+        lazy_static! {
+            pub(crate) static ref TEST_MEM_FS1: MemFS = MemFS::default();
+        }
+        let fs = &*TEST_MEM_FS1;
+        let db: DB<MemFile, BTMap> = DB::open("test_reopen".to_string(), opts.clone(), fs).unwrap();
+        let mut mem = BTMap::default();
+        let mut kvs = HashMap::new();
+        for i in 0..10000 {
+            let uk = format!("key:{}", i);
+            let value = format!("value:{}:{}:{}", i, i, i);
+            let ik = InternalKeyRef::from((uk.as_ref(), i)).to_owned();
+            if i % 20 == 0 {
+                kvs.insert(ik, None);
+                assert!(db.del(uk.into()).is_ok());
+            } else {
+                kvs.insert(ik, Some(value.clone()));
+                assert!(db.set(uk.into(), value.into()).is_ok());
+            }
+        }
+        drop(db);
+        let db: DB<MemFile, BTMap> = DB::open("test_reopen".to_string(), opts.clone(), fs).unwrap();
+        for (k, v) in kvs.iter() {
+            let vv = v.clone().map(|x| Bytes::from(x));
+            assert_eq!(db.get(k.ukey()).unwrap(), vv);
+        }
+    }
+
     #[test]
     fn test_concatenating_scanner() {}
 

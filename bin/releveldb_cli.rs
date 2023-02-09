@@ -1,6 +1,9 @@
+extern crate core;
+
+use std::collections::HashMap;
 use bytes::Bytes;
 use crossbeam::channel::Sender;
-use releveldb::compare::BytewiseComparator;
+use releveldb::compare::BYTEWISE_COMPARATOR;
 use releveldb::db::{DBScanner, DB};
 use releveldb::io::{OsFS, StorageSystem, OS_FS};
 use releveldb::memtable::simple::BTMap;
@@ -11,12 +14,13 @@ use releveldb::utils::any::Any;
 use std::fs::File;
 use std::io::{Read, Write};
 use std::sync::Arc;
+use releveldb::utils::crc::crc32;
+use releveldb::wal::WalReader;
 
 fn interactive() {
     let opts = get_opts(Any::new(()));
     let dirname = format!("{}/data", OsFS::default().pwd().unwrap());
-    let db: DB<BytewiseComparator, File, BTMap> =
-        DB::open(dirname.clone(), opts.clone(), &OS_FS).unwrap();
+    let db: DB<File, BTMap> = DB::open(dirname.clone(), opts.clone(), &OS_FS).unwrap();
     let mut cmd = String::new();
     loop {
         cmd.clear();
@@ -87,7 +91,7 @@ fn log_compaction(data: &Any, key: &[u8], seq_num: u64, value: Option<Bytes>) ->
     true
 }
 
-fn get_opts(a: Any) -> Opts<BytewiseComparator> {
+fn get_opts(a: Any) -> Opts {
     Arc::new(OptsRaw {
         filter_name: Some("leveldb.BuiltinBloomFilter2".to_string()),
         verify_checksum: false,
@@ -95,13 +99,14 @@ fn get_opts(a: Any) -> Opts<BytewiseComparator> {
         block_restart_interval: 16,
         block_size: 4096,
         compression: true,
-        comparer: BytewiseComparator::default(),
+        comparer: BYTEWISE_COMPARATOR,
         error_if_db_exists: false,
         write_buffer_size: 4096000,
         max_file_size: 4 * 1024 * 1024,
         // compact_hook: (a, log_compaction),
         compact_hook: (a, empty_compact_hook),
         flush_wal: false,
+        tiered_parallel: true,
     })
 }
 
@@ -110,23 +115,35 @@ fn main() {
     let subcmd = args[1].clone();
     match subcmd.to_lowercase().as_str() {
         "interactive" => interactive(),
-        "learn_file" => match args.get(2) {
+        "learn_sst" => match args.get(2) {
             None => return println!("file number should be specified"),
-            Some(n) => learn_file(n.as_str()),
+            Some(n) => learn_sst(n.as_str()),
         },
+        "learn_wal" => match args.get(2) {
+            None => panic!("file name of wal should be specified"),
+            Some(v) => learn_wal(v.as_str()),
+        }
         "load" => {
             let filename = match args.get(2) {
                 None => "test.data".to_string(),
                 Some(v) => v.clone(),
             };
             load(filename);
+            // interactive();
+        },
+        "test_query" => {
+            let filename = match args.get(2) {
+                None => "test.data".to_string(),
+                Some(v) => v.clone(),
+            };
+            test_query(filename);
         }
         _ => unimplemented!(),
     }
     return;
 }
 
-fn learn_file(name: &str) {
+fn learn_sst(name: &str) {
     let opts = get_opts(Any::new(0));
     let fs = OsFS::default();
     let dirname = format!("{}/data", OsFS::default().pwd().unwrap());
@@ -146,36 +163,47 @@ fn learn_file(name: &str) {
     }
 }
 
+fn learn_wal(name: &str) {
+    let fs = OsFS::default();
+    let dirname = format!("{}/data", OsFS::default().pwd().unwrap());
+    let full_name = format!("{}/{}", dirname, name);
+    let f = fs.open(full_name.as_str()).unwrap();
+    let mut reader = WalReader::new(f, "wal".to_string()).unwrap();
+    loop {
+        match reader.next() {
+            Err(e) => panic!("{:?}", e),
+            Ok(Some(v)) => println!("{:?}", Bytes::from(v)),
+            Ok(None) => break,
+        }
+    }
+}
+
 fn load(filename: String) {
+    const THREADS: usize = 4;
+
     let opts = get_opts(Any::new(()));
     let dirname = format!("{}/data", OsFS::default().pwd().unwrap());
-    let db: DB<BytewiseComparator, File, BTMap> =
-        DB::open(dirname.clone(), opts.clone(), &OS_FS).unwrap();
+    let db: DB<File, BTMap> = DB::open(dirname.clone(), opts.clone(), &OS_FS).unwrap();
     let mut f = File::open(filename).expect("file not found");
     let mut buf = String::new();
     f.read_to_string(&mut buf).expect("failed to read file");
-    let mut cmds = vec![];
+    let mut cmd_groups = vec![vec![];THREADS];
     for (i, line) in buf.split("\n").enumerate() {
         let params = line
             .split(" ")
             .map(|x| x.to_string())
             .collect::<Vec<String>>();
-        match params.len() {
+        let (k, v) = match params.len() {
             0 => continue,
-            1 => cmds.push((params[0].clone(), None)),
-            2 => cmds.push((params[0].clone(), Some(params[1].clone()))),
-            _ => println!("too many arguments at line {}", i),
-        }
-    }
-
-    let mut cmd_groups = vec![vec![], vec![], vec![], vec![]];
-    let mut i = 0;
-    for cmd in cmds.into_iter() {
-        cmd_groups[i % 4].push(cmd);
-        i += 1;
+            1 => (params[0].clone(), None),
+            2 => (params[0].clone(), Some(params[1].clone())),
+            _ => panic!("too many arguments at line {}", i),
+        };
+        let hash = crc32(k.as_bytes()) as usize;
+        cmd_groups[hash%THREADS].push((k, v));
     }
     let mut threads = vec![];
-    for _ in 0..4 {
+    for _ in 0..THREADS {
         let db_c = db.clone();
         let cmds = cmd_groups.pop().unwrap();
         let j = std::thread::spawn(move || {
@@ -196,3 +224,50 @@ fn load(filename: String) {
         t.join().unwrap();
     }
 }
+
+fn test_query(filename: String) {
+    const THREADS: usize = 8;
+
+    let opts = get_opts(Any::new(()));
+    let dirname = format!("{}/data", OsFS::default().pwd().unwrap());
+    let db: DB<File, BTMap> = DB::open(dirname.clone(), opts.clone(), &OS_FS).unwrap();
+    let mut f = File::open(filename).expect("file not found");
+    let mut buf = String::new();
+    f.read_to_string(&mut buf).expect("failed to read file");
+    let mut kvs_groups = vec![HashMap::new(); THREADS];
+
+    for (i, line) in buf.split("\n").enumerate() {
+        let params = line
+            .split(" ")
+            .map(|x| x.to_string())
+            .collect::<Vec<String>>();
+        let (k, v) = match params.len() {
+            0 => continue,
+            1 => (params[0].clone(), None),
+            2 => (params[0].clone(), Some(params[1].clone())),
+            _ => panic!("too many arguments at line {}", i),
+        };
+        let hash = crc32(k.as_bytes()) as usize;
+        kvs_groups[hash % THREADS].insert(k, v);
+    }
+
+    let mut threads = vec![];
+    for _ in 0..THREADS {
+        let db_c = db.clone();
+        let kvs = kvs_groups.pop().unwrap();
+        let j = std::thread::spawn(move || {
+            for (k, v) in kvs.iter() {
+                let vv = db_c.get(k.as_bytes()).unwrap();
+                if vv.as_ref() != v.as_ref().map(|x| Bytes::from(x.clone())).as_ref() {
+                    println!("not equal. key: {:?}, expected: {:?}, result: {:?}", k, v, vv);
+                } else {
+                }
+            }
+        });
+        threads.push(j);
+    }
+    for t in threads {
+        t.join().unwrap();
+    }
+}
+

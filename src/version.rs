@@ -1,29 +1,33 @@
-use crate::compare::Comparator;
+use crate::compare::{Comparator, ComparatorImpl};
 use crate::db::BGWorkTask;
 use crate::filename::{db_filename, set_current_file, FileType};
 use crate::io::{Encoding, Storage, StorageSystem};
 use crate::key::{InternalKey, InternalKeyComparator, InternalKeyRef};
 use crate::opts::Opts;
-use crate::sstable::reader::{BlockCache, LRUCache, SSTableReader};
+use crate::sstable::reader::{BlockCache, SSTEntry, SSTableReader};
 use crate::utils::varint::{put_uvarint, take_uvarint};
 use crate::wal::{WalReader, WalWriter};
 use crate::{LError, L0_COMPACTION_TRIGGER};
 use bytes::{Bytes, BytesMut};
-use crossbeam::channel::Sender;
+use crossbeam::channel::{unbounded, Receiver, Sender};
 use std::cmp::Ordering;
 use std::collections::HashSet;
 use std::fmt::{Debug, Formatter};
 use std::sync::{Arc, Mutex};
+use std::sync::atomic::Ordering::Relaxed;
+use crate::sstable::metric::Metric;
+use crate::utils::lru::LRUCache;
 
 pub const LEVELS: usize = 7;
 
-pub(crate) struct VersionSet<C: Comparator, O: Storage> {
+pub(crate) struct VersionSet<O: Storage> {
     dirname: String,
-    pub(crate) opts: Opts<C>,
-    ucmp: C,
+    pub(crate) opts: Opts,
+    ucmp: ComparatorImpl,
     #[allow(unused)]
-    icmp: InternalKeyComparator<C>,
+    icmp: InternalKeyComparator,
     version: VersionPtr<O>,
+    #[allow(unused)]
     clean_trigger: Sender<BGWorkTask>,
 
     pub(crate) block_cache: BlockCache,
@@ -32,19 +36,21 @@ pub(crate) struct VersionSet<C: Comparator, O: Storage> {
     pub(crate) next_file_number: u64,
     pub(crate) last_sequence: u64,
 
-    // TODO: need to move this to Opts
     pub(crate) fs: &'static dyn StorageSystem<O = O>,
 
     pub(crate) manifest_file_number: u64,
     pub(crate) manifest_file: Arc<Mutex<Option<WalWriter<O>>>>,
+
+    pub(crate) metric: Metric,
 }
 
-impl<C: Comparator, O: Storage> VersionSet<C, O> {
+impl<O: Storage> VersionSet<O> {
     pub(crate) fn new(
         dirname: String,
-        event_trigger: Sender<BGWorkTask>,
-        opts: Opts<C>,
+        bgevent_trigger: Sender<BGWorkTask>,
+        opts: Opts,
         fs: &'static dyn StorageSystem<O = O>,
+        metric: Metric,
     ) -> Self {
         Self {
             dirname: dirname,
@@ -52,14 +58,15 @@ impl<C: Comparator, O: Storage> VersionSet<C, O> {
             icmp: InternalKeyComparator::from(opts.get_comparator()),
             block_cache: LRUCache::new(opts.get_block_cache_limit()),
             opts: opts,
-            version: Arc::new(Version::default()),
+            version: Arc::new(Version::new(bgevent_trigger.clone())),
             log_number: 0,
             next_file_number: 0,
             last_sequence: 0,
             manifest_file_number: 0,
             manifest_file: Arc::new(Mutex::new(None)),
-            clean_trigger: event_trigger,
+            clean_trigger: bgevent_trigger,
             fs,
+            metric,
         }
     }
 
@@ -91,7 +98,7 @@ impl<C: Comparator, O: Storage> VersionSet<C, O> {
         }
     }
 
-    pub(crate) fn load(&mut self, opts: Opts<C>) -> Result<(), LError> {
+    pub(crate) fn load(&mut self, opts: Opts) -> Result<(), LError> {
         let manifest_name = {
             let mut f = self
                 .fs
@@ -138,7 +145,7 @@ impl<C: Comparator, O: Storage> VersionSet<C, O> {
                 None => break,
             };
             let ve = VersionEdit::decode(&mut log, &opts)?;
-            version = version.edit(&ve);
+            version = version.edit(&ve, self.icmp);
             copy_if_meaningful(&mut self.log_number, ve.log_number);
             copy_if_meaningful(&mut self.next_file_number, ve.next_file_number);
             copy_if_meaningful(&mut self.last_sequence, ve.last_sequence);
@@ -157,23 +164,40 @@ impl<C: Comparator, O: Storage> VersionSet<C, O> {
             self.next_file_number = self.log_number + 1;
         }
         self.manifest_file_number = self.next_file_number;
+
         for files in version.files.iter_mut() {
-            for i in 0..files.len() {
-                if files[i].file.is_none() || files[i].clean_trigger.is_none() {
-                    let table_name =
-                        db_filename(self.dirname.as_str(), FileType::Table(files[i].num));
+            let is_leveled = files.is_leveled();
+            for file in files.as_mut() {
+                if file.file.is_none() {
+                    let table_name = db_filename(self.dirname.as_str(), FileType::Table(file.num));
                     let table = self.fs.open(table_name.as_str())?;
-                    let mut reader = SSTableReader::open(table, files[i].num, &self.opts)?;
+                    let mut reader = SSTableReader::open(table, file.num, &self.opts)?;
                     reader.set_cache_handle(self.block_cache.clone());
-                    let opened_file = DataFilePtr::new(DataFile {
-                        num: files[i].num,
-                        size: files[i].size,
-                        smallest: files[i].smallest.clone(),
-                        largest: files[i].largest.clone(),
+
+                    let mut opened_file = DataFile {
+                        num: file.num,
+                        size: file.size,
+                        smallest: file.smallest.clone(),
+                        largest: file.largest.clone(),
                         file: Some(reader),
-                        clean_trigger: Some(self.clean_trigger.clone()),
-                    });
-                    files[i] = opened_file;
+                        key_stream: None,
+                    };
+                    let dfp = if !is_leveled {
+                        let (tx, rx) = unbounded();
+                        opened_file.key_stream = Some(tx);
+                        let opened_file = DataFilePtr::new(opened_file);
+                        let file = opened_file.file.clone();
+                        let metric = self.metric.clone();
+                        let _ = std::thread::spawn(move || {
+                            metric.threads.fetch_add(1, Relaxed);
+                            DataFile::serve_queries(file, rx);
+                            metric.threads.fetch_sub(1, Relaxed);
+                        });
+                        opened_file
+                    } else {
+                        DataFilePtr::new(opened_file)
+                    };
+                    *file = dfp;
                 }
             }
         }
@@ -184,7 +208,10 @@ impl<C: Comparator, O: Storage> VersionSet<C, O> {
     pub(crate) fn make_snapshot(&self) -> VersionEdit<O> {
         let mut ve = VersionEdit::empty();
         for (level, files) in self.current_version().files.iter().enumerate() {
-            files.iter().for_each(|x| ve.new_file(level, x.clone()));
+            files
+                .as_ref()
+                .iter()
+                .for_each(|x| ve.new_file(level, x.clone()));
         }
         ve.comparator_name = self.ucmp.name().to_string();
         ve
@@ -220,6 +247,7 @@ impl<C: Comparator, O: Storage> VersionSet<C, O> {
 }
 
 pub(crate) type DataFilePtr<S> = Arc<DataFile<S>>;
+pub(crate) type AsyncQuery = (Bytes, Sender<Result<Option<SSTEntry>, LError>>, Opts);
 
 #[derive(Clone)]
 pub(crate) struct DataFile<S: Storage> {
@@ -228,7 +256,54 @@ pub(crate) struct DataFile<S: Storage> {
     pub(crate) smallest: InternalKey,
     pub(crate) largest: InternalKey,
     pub(crate) file: Option<SSTableReader<S>>,
-    pub(crate) clean_trigger: Option<Sender<BGWorkTask>>,
+    pub(crate) key_stream: Option<Sender<AsyncQuery>>,
+}
+
+impl<S: Storage> DataFile<S> {
+    pub(crate) fn may_contains(&self, ukey: &[u8], ucmp: ComparatorImpl) -> bool {
+        let r1 = ucmp.compare(ukey, self.smallest.ukey()) == Ordering::Less;
+        let r2 = ucmp.compare(ukey, self.largest.ukey()) == Ordering::Greater;
+        !(r1 || r2)
+    }
+
+    pub(crate) fn search(&self, ukey: &[u8], opts: &Opts) -> Result<Option<SSTEntry>, LError> {
+        match self.file.as_ref() {
+            None => Err(LError::Internal("db file is not opened".to_string())),
+            Some(f) => f.get(ukey, opts),
+        }
+    }
+
+    pub(crate) fn search_parallel(
+        &self,
+        key: Bytes,
+        value_tx: Sender<Result<Option<SSTEntry>, LError>>,
+        opts: Opts,
+    ) -> Result<(), LError> {
+        match self.key_stream.as_ref() {
+            Some(s) => s.send((key, value_tx, opts)).map_err(|_| {
+                LError::Internal(format!("thread for reading sst {} is broken", self.num))
+            })?,
+            None => {
+                return Err(LError::Internal(
+                    "sst file in tiered mode has no associated channels".to_string(),
+                ))
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn serve_queries(
+        file: Option<SSTableReader<S>>,
+        key_rx: Receiver<(Bytes, Sender<Result<Option<SSTEntry>, LError>>, Opts)>,
+    ) {
+        for (k, value_tx, opts) in key_rx {
+            let res = match file.as_ref() {
+                None => Err(LError::Internal("db file is not opened".to_string())),
+                Some(f) => f.get(k.as_ref(), &opts),
+            };
+            let _ = value_tx.send(res);
+        }
+    }
 }
 
 impl<S: Storage> Debug for DataFile<S> {
@@ -242,20 +317,8 @@ impl<S: Storage> Debug for DataFile<S> {
     }
 }
 
-// nobody need this file, meaning that we can delete it now.
-// FIXME we need to avoid deleting a sst file when the process exits.
-impl<T: Storage> Drop for DataFile<T> {
-    fn drop(&mut self) {
-        if self.file.is_some() {
-            if let Some(tx) = self.clean_trigger.take() {
-                let _ = tx.send(BGWorkTask::CleanSST(self.num));
-            }
-        }
-    }
-}
-
-pub(crate) fn ikey_range<C: Comparator, S: Storage>(
-    icmp: InternalKeyComparator<C>,
+pub(crate) fn ikey_range<S: Storage>(
+    icmp: InternalKeyComparator,
     f0: &[DataFilePtr<S>],
     f1: Option<&[DataFilePtr<S>]>,
 ) -> (InternalKey, InternalKey) {
@@ -280,94 +343,247 @@ pub(crate) fn ikey_range<C: Comparator, S: Storage>(
     (smallest, largest)
 }
 
+#[derive(Debug)]
+pub(crate) enum LevelMode<S: Storage> {
+    // sstables in tiered levels may have overlaps
+    Tiered(Vec<DataFilePtr<S>>),
+    // sstables in leveled levels form a single run
+    Leveled(Vec<DataFilePtr<S>>),
+}
+
+impl<S: Storage> Default for LevelMode<S> {
+    fn default() -> Self {
+        LevelMode::Leveled(vec![])
+    }
+}
+
+impl<S: Storage> AsRef<Vec<DataFilePtr<S>>> for LevelMode<S> {
+    fn as_ref(&self) -> &Vec<DataFilePtr<S>> {
+        match self {
+            LevelMode::Leveled(files) => files,
+            LevelMode::Tiered(files) => files,
+        }
+    }
+}
+
+impl<S: Storage> AsMut<Vec<DataFilePtr<S>>> for LevelMode<S> {
+    fn as_mut(&mut self) -> &mut Vec<DataFilePtr<S>> {
+        match self {
+            LevelMode::Leveled(files) => files,
+            LevelMode::Tiered(files) => files,
+        }
+    }
+}
+
+impl<S: Storage> LevelMode<S> {
+    pub(crate) fn is_leveled(&self) -> bool {
+        match self {
+            LevelMode::Leveled(_) => true,
+            LevelMode::Tiered(_) => false,
+        }
+    }
+
+    pub(crate) fn search_in_level(&self, ikey: &InternalKeyRef, opts: &Opts) -> Result<Option<SSTEntry>, LError> {
+        let ukey = ikey.ukey;
+
+        let r = match self {
+            LevelMode::Tiered(files) => {
+                if opts.get_tiered_parallel() {
+                    let (value_tx, value_rx) = crossbeam::channel::bounded(files.len());
+                    for file in files.iter().rev() {
+                        if file.may_contains(ikey.ukey, opts.get_comparator()) {
+                            file.search_parallel(
+                                ukey.to_vec().into(),
+                                value_tx.clone(),
+                                opts.clone(),
+                            )?;
+                        }
+                    }
+                    drop(value_tx);
+                    let mut result: Option<(InternalKey, Bytes)> = None;
+                    for v in value_rx {
+                        if let Some((k, v)) = v? {
+                            match result.as_mut() {
+                                None => result = Some((k, v)),
+                                Some((s, _)) => {
+                                    if k.seq_num() >= s.seq_num() {
+                                        result = Some((k, v));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    result
+                } else {
+                    for file in files.iter().rev() {
+                        if let Ok(Some(entry)) = file.search(ukey, opts) {
+                            return Ok(Some(entry));
+                        }
+                    }
+                    None
+                }
+            }
+            LevelMode::Leveled(files) => {
+                // FIXME: use binary search
+                let r = files
+                    .iter()
+                    .find(|x| x.may_contains(ikey.ukey, opts.get_comparator()));
+                if let Some(f) = r
+                {
+                    if let Ok(Some(entry)) = f.search(ukey, opts) {
+                        return Ok(Some(entry));
+                    }
+                }
+                None
+            }
+        };
+        Ok(r)
+    }
+
+    pub(crate) fn total_size(&self) -> u64 {
+        self.as_ref().iter().map(|x| x.size).sum()
+    }
+
+    pub(crate) fn nums(&self) -> usize {
+        self.as_ref().len()
+    }
+
+    pub(crate) fn add(&mut self, file: DataFilePtr<S>) {
+        self.as_mut().push(file);
+    }
+
+    pub(crate) fn ensure_in_order(&mut self, c: InternalKeyComparator) {
+        match self {
+            LevelMode::Tiered(files) => {
+                files.sort_by(|a: &DataFilePtr<S>, b: &DataFilePtr<S>| a.num.cmp(&b.num))
+            }
+            LevelMode::Leveled(files) => files.sort_by(|a: &DataFilePtr<S>, b: &DataFilePtr<S>| {
+                c.compare(a.smallest.as_ref(), b.smallest.as_ref())
+            }),
+        }
+    }
+}
+
 pub(crate) type VersionPtr<S> = Arc<Version<S>>;
 
 #[derive(Debug)]
 pub(crate) struct Version<S: Storage> {
-    files: Vec<Vec<DataFilePtr<S>>>,
-    pub(crate) compaction_score: f64,
-    pub(crate) compaction_level: usize,
+    files: Vec<LevelMode<S>>,
+    // pub(crate) compaction_score: Option<f64>,
+    // pub(crate) compaction_level: Option<usize>,
+    pub(crate) compaction: Option<(usize, f64)>,
     pub(crate) seek_compact: Option<(DataFilePtr<S>, usize)>,
+    pub(crate) clean_trigger: Option<Sender<BGWorkTask>>,
 }
 
 impl<S: Storage> Default for Version<S> {
     fn default() -> Self {
         Self {
-            files: (0..LEVELS).map(|_x| vec![]).collect(),
-            compaction_level: 0,
-            compaction_score: 0f64,
+            files: (0..LEVELS)
+                .map(|x| {
+                    if x == 0 {
+                        LevelMode::Tiered(vec![])
+                    } else {
+                        LevelMode::Leveled(vec![])
+                    }
+                })
+                .collect(),
+            compaction: None,
             seek_compact: None,
+            clean_trigger: None,
+        }
+    }
+}
+
+// No clients need this version anymore, means some files in this version
+// may have been compacted to new ones in the next level. So we can delete
+// them now.
+impl<S: Storage> Drop for Version<S> {
+    fn drop(&mut self) {
+        if let Some(tx) = self.clean_trigger.take() {
+            let file_nums = self.all_file_nums().into_iter().collect::<Vec<u64>>();
+            let _ = tx.send(BGWorkTask::TryCleanSSTs(file_nums));
         }
     }
 }
 
 impl<S: Storage> Version<S> {
+    pub(crate) fn new(bgevent_trigger: Sender<BGWorkTask>) -> Self {
+        let mut v = Version::default();
+        v.clean_trigger = Some(bgevent_trigger);
+        v
+    }
+
     pub(crate) fn file_nums_in_level(&self, l: usize) -> usize {
         if l > LEVELS {
             panic!("level is too high and we have no files there");
         }
-        self.files[l].len()
+        self.files[l].nums()
+    }
+
+    pub(crate) fn all_file_nums(&self) -> HashSet<u64> {
+        let mut res = HashSet::new();
+        for files in self.files.iter() {
+            files.as_ref().iter().for_each(|x| {
+                let _ = res.insert(x.num);
+            });
+        }
+        res
     }
 
     pub(crate) fn files_in_level(&self, l: usize) -> &Vec<DataFilePtr<S>> {
         self.files[l].as_ref()
     }
 
-    pub(crate) fn edit(&self, ve: &VersionEdit<S>) -> Version<S> {
+    pub(crate) fn edit(&self, ve: &VersionEdit<S>, icmp: InternalKeyComparator) -> Version<S> {
         let mut new_version = Version::default();
         for (level, files) in new_version.files.iter_mut().enumerate() {
-            for file in self.files[level].iter() {
+            for file in self.files[level].as_ref() {
                 if ve.deleted_files.contains(&DeleteFileEntry(level, file.num)) {
                     continue;
                 }
-                files.push(file.clone());
+                files.add(file.clone());
             }
         }
         for new_file in ve.new_files.iter() {
-            new_version.files[new_file.0 as usize].push(new_file.1.clone());
+            new_version.files[new_file.0 as usize].add(new_file.1.clone());
         }
 
-        for (_, files) in new_version.files.iter_mut().enumerate() {
-            files.sort_by(|a, b| a.num.cmp(&b.num));
+        for (_, level) in new_version.files.iter_mut().enumerate() {
+            level.ensure_in_order(icmp);
         }
         new_version.update_compaction_score();
+        new_version.clean_trigger = self.clean_trigger.clone();
         new_version
     }
 
     fn update_compaction_score(&mut self) {
-        self.compaction_score = (self.files[0].len() as f64) / (L0_COMPACTION_TRIGGER as f64);
-        self.compaction_level = 0;
-        let mut max_bytes = (10 * 1024 * 1024) as f64;
-        for level in 1..self.files.len() {
-            let files = &self.files[level];
-            let total_size = files.iter().map(|x| x.size).sum::<u64>();
-            let score = (total_size as f64) / max_bytes;
-            if score > self.compaction_score {
-                self.compaction_score = score;
-                self.compaction_level = level;
-            }
-            max_bytes *= 10.0;
+        let l0_score =  (self.files[0].nums() as f64) / (L0_COMPACTION_TRIGGER as f64);
+        // l0 level is not empty
+        if l0_score >= 0.0 {
+            self.compaction = Some((0, l0_score));
         }
-
+        let mut max_bytes = (10 * 1024 * 1024) as f64;
         for (level, files) in self.files[1..].iter().enumerate() {
-            let total_size = files.iter().map(|x| x.size).sum::<u64>();
-            let score = (total_size as f64) / max_bytes;
-            if score > self.compaction_score {
-                self.compaction_score = score;
-                self.compaction_level = level;
+            let score = (files.total_size() as f64) / max_bytes;
+            if let Some(s) = self.compaction.and_then(|(_, s)| Some(s)) {
+                if score > s {
+                    self.compaction = Some((level+1, score));
+                }
             }
             max_bytes *= 10.0;
         }
     }
 
-    pub(crate) fn overlaps<C: Comparator>(
+    pub(crate) fn overlaps(
         &self,
         level: usize,
-        ucmp: C,
+        ucmp: ComparatorImpl,
         ukey0: &[u8],
         ukey1: &[u8],
     ) -> Vec<DataFilePtr<S>> {
         self.files[level]
+            .as_ref()
             .iter()
             .filter(|x| {
                 !((ucmp.compare(x.smallest.ukey().as_ref(), ukey1) == Ordering::Greater)
@@ -378,11 +594,11 @@ impl<S: Storage> Version<S> {
     }
 
     #[allow(unused)]
-    fn check_ordering<C: Comparator>(&self, icmp: InternalKeyComparator<C>) -> bool {
+    fn check_ordering(&self, icmp: InternalKeyComparator) -> bool {
         for (level, files) in self.files.iter().enumerate() {
             let mut prev_file_num = 0u64;
             let mut prev_largest = InternalKey::default();
-            for (i, file) in files.iter().enumerate() {
+            for (i, file) in files.as_ref().iter().enumerate() {
                 if icmp.compare(file.smallest.as_ref(), file.largest.as_ref()) == Ordering::Greater
                 {
                     return false;
@@ -408,39 +624,10 @@ impl<S: Storage> Version<S> {
 
 impl<S: Storage> Version<S> {
     // TODO need to collect statistics when querying the db files, in order to help to make decisions on compactions
-    pub(crate) fn get<C: Comparator>(
-        &self,
-        ikey: InternalKeyRef,
-        opts: &Opts<C>,
-    ) -> Result<Option<Bytes>, LError> {
-        let ukey = ikey.ukey;
-        let ucmp = opts.get_comparator();
-        let ik = ikey.to_owned();
-        let may_find = |file: &DataFilePtr<S>| -> bool {
-            let r1 = ucmp.compare(ukey, file.smallest.ukey()) == Ordering::Less;
-            let r2 = ucmp.compare(ukey, file.largest.ukey()) == Ordering::Greater;
-            !(r1 || r2)
-        };
-        let search_in_file = |file: &DataFilePtr<S>| -> Result<Option<Bytes>, LError> {
-            match file.file.as_ref() {
-                None => Err(LError::Internal("db file is not opened".to_string())),
-                Some(f) => f.get(ik.as_ref(), opts),
-            }
-        };
-        for file in self.files[0].iter().rev() {
-            if may_find(file) {
-                if let Ok(Some(v)) = search_in_file(file) {
-                    return Ok(Some(v));
-                }
-            }
-        }
-        // search the left levels
-        for files in self.files[1..].iter() {
-            // FIXME maybe binary search is better?
-            if let Some(f) = files.iter().find(|x| may_find(x)) {
-                if let Ok(Some(v)) = search_in_file(f) {
-                    return Ok(Some(v));
-                }
+    pub(crate) fn get(&self, ikey: InternalKeyRef, opts: &Opts) -> Result<Option<SSTEntry>, LError> {
+        for files in self.files.iter() {
+            if let Some(v) = files.search_in_level(&ikey, opts)? {
+                return Ok(Some(v));
             }
         }
         Ok(None)
@@ -528,7 +715,7 @@ impl<S: Storage> VersionEdit<S> {
 }
 
 impl<S: Storage> Encoding for VersionEdit<S> {
-    fn encode<T: Comparator>(&self, dst: &mut BytesMut, _opts: &Opts<T>) -> usize {
+    fn encode(&self, dst: &mut BytesMut, _opts: &Opts) -> usize {
         let s = dst.len();
         if !self.comparator_name.is_empty() {
             put_uvarint(dst, TAG_COMPARATOR);
@@ -572,7 +759,7 @@ impl<S: Storage> Encoding for VersionEdit<S> {
         dst.len() - s
     }
 
-    fn decode<T: Comparator>(src: &mut Bytes, _opts: &Opts<T>) -> Result<Self, LError> {
+    fn decode(src: &mut Bytes, _opts: &Opts) -> Result<Self, LError> {
         let mut ve = VersionEdit::empty();
         let must_take_uvarint = |src: &mut Bytes| -> Result<u64, LError> {
             take_uvarint(src).ok_or(LError::InvalidFile("the MANIFEST file is malformat".into()))
@@ -621,7 +808,7 @@ impl<S: Storage> Encoding for VersionEdit<S> {
                                 smallest: smallest,
                                 largest: largest,
                                 file: None,
-                                clean_trigger: None,
+                                key_stream: None,
                             }),
                         ));
                     }
@@ -650,12 +837,14 @@ pub(crate) struct NewFileEntry<S: Storage>(usize, DataFilePtr<S>);
 
 #[cfg(test)]
 mod test {
+    use crate::compare::BYTEWISE_COMPARATOR;
     use crate::io::MemFile;
-    use crate::key::InternalKeyRef;
+    use crate::key::{InternalKeyComparator, InternalKeyRef};
     use crate::version::{DataFile, DataFilePtr, Version, VersionEdit};
 
     #[test]
     fn test_version_edit() {
+        let icmp = InternalKeyComparator::from(BYTEWISE_COMPARATOR);
         let make_data_file = |num: u64| -> DataFilePtr<MemFile> {
             let sm = format!("{}", num * 10);
             let lg = format!("{}", (num + 1) * 10 - 1);
@@ -665,7 +854,7 @@ mod test {
                 smallest: InternalKeyRef::from((sm.as_bytes(), num * 10)).to_owned(),
                 largest: InternalKeyRef::from((lg.as_bytes(), (num + 1) * 10 - 1)).to_owned(),
                 file: None,
-                clean_trigger: None,
+                key_stream: None,
             })
         };
 
@@ -678,7 +867,7 @@ mod test {
         for (level, file) in files.iter() {
             ve0.new_file(*level, file.clone());
         }
-        let version1 = version0.edit(&ve0);
+        let version1 = version0.edit(&ve0, icmp);
         assert_eq!(
             version1
                 .files_in_level(0)
@@ -721,7 +910,7 @@ mod test {
         }
         ve1.delete_file(0, 4);
         ve1.delete_file(1, 9);
-        let version2 = version1.edit(&ve1);
+        let version2 = version1.edit(&ve1, icmp);
         assert_eq!(
             version2
                 .files_in_level(0)
@@ -744,7 +933,7 @@ mod test {
                 .iter()
                 .map(|x| x.num)
                 .collect::<Vec<u64>>(),
-            vec![2u64, 6, 11, 12]
+            vec![11u64, 12, 2, 6]
         );
         assert_eq!(
             version2
