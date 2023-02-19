@@ -1,7 +1,6 @@
 pub mod format;
 pub mod reader;
 pub mod writer;
-pub mod metric;
 
 #[cfg(test)]
 mod test {

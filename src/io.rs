@@ -234,7 +234,9 @@ impl StorageSystem for MemFS {
 
     fn open(&self, name: &str) -> Result<Self::O, LError> {
         let mut files = self.files.lock().unwrap();
-        let a = files.entry(name.to_string()).or_insert(MemFile::new(Mutex::new((vec![], 0))));
+        let a = files
+            .entry(name.to_string())
+            .or_insert(MemFile::new(Mutex::new((vec![], 0))));
         Ok(a.clone())
     }
 
@@ -284,7 +286,10 @@ impl StorageSystem for MemFS {
                 k = k.strip_prefix("./").unwrap().to_string();
             }
             if k.starts_with(dirname.as_str()) {
-                let n = k.strip_prefix(format!("{}/", dirname).as_str()).unwrap_or_default().to_string();
+                let n = k
+                    .strip_prefix(format!("{}/", dirname).as_str())
+                    .unwrap_or_default()
+                    .to_string();
                 names.push(n);
             }
         }

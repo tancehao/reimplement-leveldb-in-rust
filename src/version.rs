@@ -3,8 +3,10 @@ use crate::db::BGWorkTask;
 use crate::filename::{db_filename, set_current_file, FileType};
 use crate::io::{Encoding, Storage, StorageSystem};
 use crate::key::{InternalKey, InternalKeyComparator, InternalKeyRef};
+use crate::metric::Metric;
 use crate::opts::Opts;
 use crate::sstable::reader::{BlockCache, SSTEntry, SSTableReader};
+use crate::utils::lru::LRUCache;
 use crate::utils::varint::{put_uvarint, take_uvarint};
 use crate::wal::{WalReader, WalWriter};
 use crate::{LError, L0_COMPACTION_TRIGGER};
@@ -13,10 +15,8 @@ use crossbeam::channel::{unbounded, Receiver, Sender};
 use std::cmp::Ordering;
 use std::collections::HashSet;
 use std::fmt::{Debug, Formatter};
-use std::sync::{Arc, Mutex};
 use std::sync::atomic::Ordering::Relaxed;
-use crate::sstable::metric::Metric;
-use crate::utils::lru::LRUCache;
+use std::sync::{Arc, Mutex};
 
 pub const LEVELS: usize = 7;
 
@@ -171,6 +171,7 @@ impl<O: Storage> VersionSet<O> {
                 if file.file.is_none() {
                     let table_name = db_filename(self.dirname.as_str(), FileType::Table(file.num));
                     let table = self.fs.open(table_name.as_str())?;
+                    self.metric.incr_opened_files();
                     let mut reader = SSTableReader::open(table, file.num, &self.opts)?;
                     reader.set_cache_handle(self.block_cache.clone());
 
@@ -383,7 +384,11 @@ impl<S: Storage> LevelMode<S> {
         }
     }
 
-    pub(crate) fn search_in_level(&self, ikey: &InternalKeyRef, opts: &Opts) -> Result<Option<SSTEntry>, LError> {
+    pub(crate) fn search_in_level(
+        &self,
+        ikey: &InternalKeyRef,
+        opts: &Opts,
+    ) -> Result<Option<SSTEntry>, LError> {
         let ukey = ikey.ukey;
 
         let r = match self {
@@ -424,15 +429,21 @@ impl<S: Storage> LevelMode<S> {
                 }
             }
             LevelMode::Leveled(files) => {
-                // FIXME: use binary search
-                let r = files
-                    .iter()
-                    .find(|x| x.may_contains(ikey.ukey, opts.get_comparator()));
-                if let Some(f) = r
-                {
-                    if let Ok(Some(entry)) = f.search(ukey, opts) {
-                        return Ok(Some(entry));
+                let ucmp = opts.get_comparator();
+                let i = match files.binary_search_by(|x| ucmp.compare(x.largest.ukey(), ukey)) {
+                    Ok(i) => i,
+                    Err(i) => {
+                        if i < files.len()
+                            && !(ucmp.compare(files[i].smallest.ukey(), ukey) == Ordering::Greater)
+                        {
+                            i
+                        } else {
+                            return Ok(None);
+                        }
                     }
+                };
+                if let Ok(Some(entry)) = files[i].search(ukey, opts) {
+                    return Ok(Some(entry));
                 }
                 None
             }
@@ -558,7 +569,7 @@ impl<S: Storage> Version<S> {
     }
 
     fn update_compaction_score(&mut self) {
-        let l0_score =  (self.files[0].nums() as f64) / (L0_COMPACTION_TRIGGER as f64);
+        let l0_score = (self.files[0].nums() as f64) / (L0_COMPACTION_TRIGGER as f64);
         // l0 level is not empty
         if l0_score >= 0.0 {
             self.compaction = Some((0, l0_score));
@@ -568,7 +579,7 @@ impl<S: Storage> Version<S> {
             let score = (files.total_size() as f64) / max_bytes;
             if let Some(s) = self.compaction.and_then(|(_, s)| Some(s)) {
                 if score > s {
-                    self.compaction = Some((level+1, score));
+                    self.compaction = Some((level + 1, score));
                 }
             }
             max_bytes *= 10.0;
@@ -624,7 +635,11 @@ impl<S: Storage> Version<S> {
 
 impl<S: Storage> Version<S> {
     // TODO need to collect statistics when querying the db files, in order to help to make decisions on compactions
-    pub(crate) fn get(&self, ikey: InternalKeyRef, opts: &Opts) -> Result<Option<SSTEntry>, LError> {
+    pub(crate) fn get(
+        &self,
+        ikey: InternalKeyRef,
+        opts: &Opts,
+    ) -> Result<Option<SSTEntry>, LError> {
         for files in self.files.iter() {
             if let Some(v) = files.search_in_level(&ikey, opts)? {
                 return Ok(Some(v));

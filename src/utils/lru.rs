@@ -1,6 +1,6 @@
+use linked_hash_map_rs::LinkedHashMap;
 use std::hash::Hash;
 use std::sync::{Arc, Mutex};
-use linked_hash_map_rs::LinkedHashMap;
 
 pub(crate) trait CacheSize {
     fn appropriate_size(&self) -> usize;
@@ -34,9 +34,7 @@ impl<K: CacheSize + Hash + Eq, V: CacheSize> LRUCache<K, V> {
     }
 
     pub fn get(&mut self, k: &K) -> Option<&V> {
-        self.cache
-            .move_to_back(k)
-            .map(|(_, db)| db)
+        self.cache.move_to_back(k).map(|(_, db)| db)
     }
 
     pub fn set(&mut self, key: K, val: V) {
@@ -63,13 +61,11 @@ impl<K: CacheSize + Hash + Eq, V: CacheSize> LRUCache<K, V> {
 
 #[cfg(test)]
 mod test {
-    use std::f32::consts::E;
     use crate::utils::lru::{CacheSize, LRUCache};
 
     #[test]
     fn test_lru() {
-
-        struct Ele{}
+        struct Ele {}
 
         impl CacheSize for Ele {
             fn appropriate_size(&self) -> usize {
@@ -89,7 +85,7 @@ mod test {
             }
         }
 
-        let mut buf = LRUCache::new(14);
+        let buf = LRUCache::new(14);
         let mut buf = buf.lock().unwrap();
         assert_eq!(buf.limit(), 14);
         buf.set(1u32, 11u8);

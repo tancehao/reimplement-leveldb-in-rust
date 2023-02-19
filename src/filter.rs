@@ -1,4 +1,4 @@
-use bytes::{Bytes, BytesMut};
+use bytes::BytesMut;
 use std::cmp::{max, min};
 
 pub static BLOOM_FILTER: BloomFilter = BloomFilter { bits_per_key: 10 };
@@ -6,7 +6,7 @@ pub static BLOOM_FILTER: BloomFilter = BloomFilter { bits_per_key: 10 };
 pub trait FilterPolicy {
     fn name() -> &'static str;
 
-    fn append_filter(&self, dst: &mut BytesMut, keys: &[Bytes]) -> BytesMut;
+    fn append_filter(&self, dst: &mut BytesMut, keys: &[&[u8]]) -> BytesMut;
 
     fn may_contain(&self, filter: &[u8], key: &[u8]) -> bool;
 }
@@ -21,7 +21,7 @@ impl FilterPolicy for BloomFilter {
         "leveldb.BuiltinBloomFilter2"
     }
 
-    fn append_filter(&self, dst: &mut BytesMut, keys: &[Bytes]) -> BytesMut {
+    fn append_filter(&self, dst: &mut BytesMut, keys: &[&[u8]]) -> BytesMut {
         let bits_per_key = max(self.bits_per_key, 0);
         let k = min(max(((bits_per_key as f64) * 0.69) as u32, 1), 30);
         let mut n_bits = max(keys.len() * (bits_per_key as usize), 64);
@@ -29,7 +29,7 @@ impl FilterPolicy for BloomFilter {
         n_bits = n_bytes * 8;
         let (mut overall, mut filter) = extend(dst, n_bytes + 1);
         for key in keys {
-            let mut h = hash(key.as_ref());
+            let mut h = hash(key);
             let delta = (h >> 17) | (h << 15);
             for _ in 0..k {
                 let bit_pos = (h % (n_bits as u32)) as usize;
@@ -58,7 +58,7 @@ impl FilterPolicy for BloomFilter {
             if filter[bit_pos / 8] & (1 << (bit_pos % 8)) == 0 {
                 return false;
             }
-            h += delta;
+            h = h.wrapping_add(delta);
         }
         true
     }
@@ -67,8 +67,9 @@ impl FilterPolicy for BloomFilter {
 fn extend(d: &mut BytesMut, n: usize) -> (BytesMut, BytesMut) {
     let want = n + d.len();
     if want <= d.capacity() {
-        let overall = d.split_off(want);
-        d.iter_mut().for_each(|x| *x = 0);
+        let len = d.len();
+        d.resize(want, 0);
+        let overall = d.split_to(len);
         return (overall, d.clone());
     } else {
         let mut c: usize = 1024;
@@ -76,6 +77,7 @@ fn extend(d: &mut BytesMut, n: usize) -> (BytesMut, BytesMut) {
             c += c / 4;
         }
         let mut overall = BytesMut::with_capacity(c);
+        overall.extend_from_slice(d.as_ref());
         overall.resize(want, 0);
         let trailer = overall.split_off(d.len());
         return (overall, trailer);
@@ -102,13 +104,13 @@ pub fn hash(data: &[u8]) -> u32 {
 
     let diff = n - i;
     if diff >= 3 {
-        h += (data[i + 2] as u32) << 16
+        h = h.wrapping_add((data[i + 2] as u32) << 16);
     };
     if diff >= 2 {
-        h += (data[i + 1] as u32) << 8
+        h = h.wrapping_add((data[i + 1] as u32) << 8);
     };
     if diff >= 1 {
-        h += data[i] as u32;
+        h = h.wrapping_add(data[i] as u32);
         h = h.wrapping_mul(M);
         h ^= h >> r;
     }
@@ -118,9 +120,18 @@ pub fn hash(data: &[u8]) -> u32 {
 
 #[cfg(test)]
 mod tests {
+    use crate::filter::{BloomFilter, FilterPolicy};
+    use bytes::BytesMut;
 
     #[test]
-    fn test_small_bloom_filter() {
-        // TODO
+    fn test_bloom_filter() {
+        let filter = BloomFilter { bits_per_key: 10 };
+        let keys: Vec<String> = (0..1000).map(|x| format!("key:{}", x)).collect();
+        let mut data = BytesMut::new();
+        let key_refs: Vec<&[u8]> = keys.iter().map(|x| x.as_bytes()).collect();
+        data = filter.append_filter(&mut data, key_refs.as_ref());
+        for key in key_refs {
+            assert!(filter.may_contain(data.as_ref(), key));
+        }
     }
 }

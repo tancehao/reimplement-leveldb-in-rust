@@ -1,4 +1,4 @@
-use crate::filter::{BloomFilter, BLOOM_FILTER};
+use crate::filter::{BloomFilter, FilterPolicy, BLOOM_FILTER};
 use crate::io::{Encoding, Storage};
 use crate::key::{InternalKey, InternalKeyRef};
 use crate::opts::Opts;
@@ -26,8 +26,19 @@ pub struct BlockHandle {
 
 impl BlockHandle {
     #[inline]
-    pub fn new(offset: u64, length: u64) -> Self {
+    pub(crate) fn new(offset: u64, length: u64) -> Self {
         Self { offset, length }
+    }
+
+    #[inline]
+    pub(crate) fn offset(&self) -> u64 {
+        self.offset
+    }
+
+    #[inline]
+    #[allow(unused)]
+    pub(crate) fn length(&self) -> u64 {
+        self.length
     }
 }
 
@@ -588,8 +599,9 @@ impl<T: Encoding + Clone> Encoding for EntryGroup<T> {
 pub(crate) struct Filter {
     #[allow(unused)]
     data: Bytes,
+    filters: Vec<Bytes>,
     #[allow(unused)]
-    offsets: Bytes,
+    offsets: Vec<u32>,
     #[allow(unused)]
     policy: &'static BloomFilter,
     #[allow(unused)]
@@ -621,16 +633,35 @@ impl Filter {
         }
         let shift = data[data_len - 1] as u32;
         let _ = data.split_off(data_len - 1);
-        let offsets = data.split_off(last_offset as usize);
-        if offsets.len() & 3 != 0 {
+        let mut offsets_data = data.split_off(last_offset as usize);
+        if offsets_data.len() % 4 != 0 {
             return None;
+        }
+        let mut offsets = vec![];
+        while !offsets_data.is_empty() {
+            let o = offsets_data.split_to(4);
+            offsets.push(u32::from_le_bytes(o.as_ref().try_into().unwrap()));
+        }
+        let mut filters = vec![];
+        for i in 1..offsets.len() {
+            let len = offsets[i] - offsets[i - 1];
+            filters.push(data.split_to(len as usize));
         }
         Some(Filter {
             data,
+            filters,
             offsets,
             policy,
             shift,
         })
+    }
+
+    pub(crate) fn may_contain(&self, block_offset: u64, key: &[u8]) -> bool {
+        let index = (block_offset >> self.shift) as usize;
+        if index >= self.filters.len() {
+            return true;
+        }
+        self.policy.may_contain(self.filters[index].as_ref(), key)
     }
 }
 

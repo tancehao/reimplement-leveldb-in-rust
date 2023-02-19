@@ -1,6 +1,5 @@
 extern crate core;
 
-use std::collections::HashMap;
 use bytes::Bytes;
 use crossbeam::channel::Sender;
 use releveldb::compare::BYTEWISE_COMPARATOR;
@@ -11,11 +10,12 @@ use releveldb::opts::{empty_compact_hook, Opts, OptsRaw};
 use releveldb::sstable::reader::SSTableReader;
 use releveldb::sstable::reader::SSTableScanner;
 use releveldb::utils::any::Any;
+use releveldb::utils::crc::crc32;
+use releveldb::wal::WalReader;
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::{Read, Write};
 use std::sync::Arc;
-use releveldb::utils::crc::crc32;
-use releveldb::wal::WalReader;
 
 fn interactive() {
     let opts = get_opts(Any::new(()));
@@ -122,7 +122,7 @@ fn main() {
         "learn_wal" => match args.get(2) {
             None => panic!("file name of wal should be specified"),
             Some(v) => learn_wal(v.as_str()),
-        }
+        },
         "load" => {
             let filename = match args.get(2) {
                 None => "test.data".to_string(),
@@ -130,7 +130,7 @@ fn main() {
             };
             load(filename);
             // interactive();
-        },
+        }
         "test_query" => {
             let filename = match args.get(2) {
                 None => "test.data".to_string(),
@@ -187,7 +187,7 @@ fn load(filename: String) {
     let mut f = File::open(filename).expect("file not found");
     let mut buf = String::new();
     f.read_to_string(&mut buf).expect("failed to read file");
-    let mut cmd_groups = vec![vec![];THREADS];
+    let mut cmd_groups = vec![vec![]; THREADS];
     for (i, line) in buf.split("\n").enumerate() {
         let params = line
             .split(" ")
@@ -200,7 +200,7 @@ fn load(filename: String) {
             _ => panic!("too many arguments at line {}", i),
         };
         let hash = crc32(k.as_bytes()) as usize;
-        cmd_groups[hash%THREADS].push((k, v));
+        cmd_groups[hash % THREADS].push((k, v));
     }
     let mut threads = vec![];
     for _ in 0..THREADS {
@@ -259,8 +259,10 @@ fn test_query(filename: String) {
             for (k, v) in kvs.iter() {
                 let vv = db_c.get(k.as_bytes()).unwrap();
                 if vv.as_ref() != v.as_ref().map(|x| Bytes::from(x.clone())).as_ref() {
-                    println!("not equal. key: {:?}, expected: {:?}, result: {:?}", k, v, vv);
-                } else {
+                    println!(
+                        "not equal. key: {:?}, expected: {:?}, result: {:?}",
+                        k, v, vv
+                    );
                 }
             }
         });
@@ -270,4 +272,3 @@ fn test_query(filename: String) {
         t.join().unwrap();
     }
 }
-

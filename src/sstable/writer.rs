@@ -4,11 +4,11 @@ use crate::key::InternalKey;
 use crate::opts::Opts;
 use crate::sstable::format::{BlockHandle, DataBlock, Filter, FilterBlock, Footer, IndexBlock};
 use crate::sstable::reader::SSTableReader;
+use crate::utils::lru::LRUCache;
 use crate::LError;
 use bytes::{BufMut, Bytes, BytesMut};
 use std::cmp::Ordering;
 use std::sync::{Arc, Mutex};
-use crate::utils::lru::LRUCache;
 
 pub struct SSTableWriter<S: Storage> {
     num: u64,
@@ -63,7 +63,7 @@ impl<S: Storage> SSTableWriter<S> {
         if !keep {
             return Ok(self.offset as usize);
         }
-        self.filter.append_key(key.as_ref());
+        self.filter.append_key(key.clone());
         self.last_key = Some(key.clone());
         self.data_block.set(key.clone().into(), value, &self.opts);
         if self.data_block.size() >= self.opts.get_block_size() {
@@ -72,6 +72,7 @@ impl<S: Storage> SSTableWriter<S> {
         Ok(self.offset as usize)
     }
 
+    // TODO: finish filter block
     fn write_block(&mut self) -> Result<(), LError> {
         let mut tmp = BytesMut::new();
         let (key, _) = self.data_block.get_nth_entry(0).unwrap();
@@ -81,6 +82,7 @@ impl<S: Storage> SSTableWriter<S> {
             .set(key, BlockHandle::new(self.offset, length), &self.opts);
         self.offset += tmp.len() as u64;
         self.data_block = DataBlock::default();
+        self.filter.finish_block(self.offset)?;
         Ok(())
     }
 
@@ -164,30 +166,18 @@ impl<S: Storage> SSTableWriter<S> {
     }
 }
 
-#[derive(Default, Debug)]
-struct BlockFilterWriter {
-    data: BytesMut,
-    lengths: Vec<usize>,
-    keys: Vec<Bytes>,
-}
-
 const FILTER_BASE_LOG: u8 = 11;
 
 #[derive(Default, Debug)]
-struct FilterWriter {
-    block: BlockFilterWriter,
+pub(crate) struct FilterWriter {
+    block: Vec<InternalKey>,
     data: BytesMut,
     offsets: Vec<u32>,
 }
 
 impl FilterWriter {
-    fn has_keys(&self) -> bool {
-        self.block.lengths.len() > 0
-    }
-
-    fn append_key(&mut self, key: &[u8]) {
-        self.block.data.put_slice(key);
-        self.block.lengths.push(key.len());
+    fn append_key(&mut self, key: InternalKey) {
+        self.block.push(key);
     }
 
     fn append_offset(&mut self) -> Result<(), LError> {
@@ -201,44 +191,68 @@ impl FilterWriter {
 
     fn emit(&mut self) -> Result<(), LError> {
         self.append_offset()?;
-        if !self.has_keys() {
+        if self.block.is_empty() {
             return Ok(());
         }
-        let (mut i, mut j) = (0, 0);
-        for length in self.block.lengths.iter() {
-            j += *length;
-            self.block.keys.push(self.block.data[i..j].to_vec().into());
-            i = j;
-        }
-        self.data = BLOOM_FILTER.append_filter(&mut self.data, self.block.keys.as_ref());
-        self.block.data.clear();
-        self.block.lengths.clear();
-        self.block.keys.clear();
+        let ukeys: Vec<&[u8]> = self.block.iter().map(|x| x.ukey()).collect();
+        self.data = BLOOM_FILTER.append_filter(&mut self.data, ukeys.as_ref());
+        self.block.clear();
         Ok(())
     }
 
-    #[allow(unused)]
     fn finish_block(&mut self, block_offset: u64) -> Result<(), LError> {
-        loop {
-            let i = block_offset >> FILTER_BASE_LOG;
-            if i <= self.offsets.len() as u64 {
-                break;
-            }
+        let i = block_offset >> FILTER_BASE_LOG;
+        while i > self.offsets.len() as u64 {
             self.emit()?;
         }
         Ok(())
     }
 
     fn finish(&mut self) -> Result<Bytes, LError> {
-        if self.has_keys() {
+        if !self.block.is_empty() {
             self.emit()?;
         }
         self.append_offset()?;
         for x in self.offsets.iter() {
-            let a = u32::to_le_bytes(*x);
-            self.data.put_slice(a.as_slice());
+            let x = u32::to_le_bytes(*x);
+            self.data.put_slice(x.as_slice());
         }
         self.data.put_u8(FILTER_BASE_LOG);
         Ok(self.data.clone().freeze())
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use crate::filter::BLOOM_FILTER;
+    use crate::io::Encoding;
+    use crate::key::InternalKeyRef;
+    use crate::opts::{Opts, OptsRaw};
+    use crate::sstable::format::{Filter, FilterBlock};
+    use crate::sstable::writer::FilterWriter;
+    use bytes::BytesMut;
+
+    #[test]
+    fn test_filter() {
+        let opts = Opts::new(OptsRaw::default());
+        let mut fw = FilterWriter::default();
+        let mut ikeys = vec![];
+        for i in 0..10 {
+            ikeys.push(InternalKeyRef::from((format!("key{}", i).as_bytes(), i)).to_owned());
+        }
+        for ik in ikeys.iter() {
+            fw.append_key(ik.clone());
+        }
+        let f = fw.finish();
+        assert!(f.is_ok());
+        let fb = FilterBlock::from(f.unwrap());
+        let mut dd = BytesMut::new();
+        fb.encode(&mut dd, &opts);
+        let fb = Filter::from_sstable_block(dd.freeze(), &BLOOM_FILTER, &opts);
+        assert!(fb.is_some());
+        let fb = fb.unwrap();
+        for ik in ikeys.iter() {
+            assert!(fb.may_contain(0, ik.ukey()));
+        }
     }
 }

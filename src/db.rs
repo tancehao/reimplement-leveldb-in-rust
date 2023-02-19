@@ -4,6 +4,7 @@ use crate::filename::{db_filename, parse_dbname, set_current_file, FileType};
 use crate::io::{Encoding, Storage, StorageSystem};
 use crate::key::{InternalKey, InternalKeyComparator, InternalKeyRef};
 use crate::memtable::MemTable;
+use crate::metric::Metric;
 use crate::opts::Opts;
 use crate::utils::call_on_drop::CallOnDrop;
 use crate::version::{VersionEdit, VersionSet, LEVELS};
@@ -15,10 +16,9 @@ use std::cmp::{max, Ordering};
 use std::collections::{HashSet, VecDeque};
 use std::ops::Deref;
 use std::path::Path;
-use std::sync::{Arc, Mutex, RwLock};
 use std::sync::atomic::Ordering::Relaxed;
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
-use crate::sstable::metric::Metric;
 
 pub struct DB<S: Storage, M: MemTable> {
     pub(crate) dirname: String,
@@ -51,7 +51,7 @@ impl<S: Storage, M: MemTable> Clone for DB<S, M> {
             file_lock: Arc::new(Mutex::new(Box::new(vec![0]))),
             compactioning: self.compactioning.clone(),
             bgwork_trigger: self.bgwork_trigger.clone(),
-            metric: Metric::default()
+            metric: Metric::default(),
         }
     }
 }
@@ -81,14 +81,16 @@ impl<M: MemTable, S: Storage> MemDB<M, S> {
         loop {
             match buf.pop_front() {
                 None => return Ok(()),
-                Some(batch) => if !batch.get_wal_written() {
-                    buf.push_front(batch);
-                    return Ok(());
-                } else {
-                    for (seq_num, k, v) in batch.iter() {
-                        match v {
-                            Some(val) => self.mem.set(k.clone(), seq_num, val.clone()),
-                            None => self.mem.del(k.clone(), seq_num),
+                Some(batch) => {
+                    if !batch.get_wal_written() {
+                        buf.push_front(batch);
+                        return Ok(());
+                    } else {
+                        for (seq_num, k, v) in batch.iter() {
+                            match v {
+                                Some(val) => self.mem.set(k.clone(), seq_num, val.clone()),
+                                None => self.mem.del(k.clone(), seq_num),
+                            }
                         }
                     }
                 }
@@ -148,8 +150,13 @@ impl<S: Storage, M: MemTable> DB<S, M> {
         };
 
         let mut inner = db.inner.lock()?;
-        inner.versions =
-            VersionSet::new(dirname.clone(), bgwork_tx.clone(), opts.clone(), fs.clone(), db.metric.clone());
+        inner.versions = VersionSet::new(
+            dirname.clone(),
+            bgwork_tx.clone(),
+            opts.clone(),
+            fs.clone(),
+            db.metric.clone(),
+        );
 
         let current_name = db_filename(dirname.as_str(), FileType::Current);
 
@@ -192,7 +199,10 @@ impl<S: Storage, M: MemTable> DB<S, M> {
         }
         let log_number = inner.versions.incr_file_number();
         let wal_name = db_filename(dirname.as_str(), FileType::WAL(log_number));
-        inner.memdb.wal = Some(Arc::new(Mutex::new((WalWriter::new(fs.create(wal_name.as_str())?), -1))));
+        inner.memdb.wal = Some(Arc::new(Mutex::new((
+            WalWriter::new(fs.create(wal_name.as_str())?),
+            -1,
+        ))));
         drop(inner);
         db.start_bgwork(bgwork_rx);
         Ok(db)
@@ -232,6 +242,8 @@ impl<S: Storage, M: MemTable> DB<S, M> {
                         let table_name = db_filename(db.dirname.as_str(), FileType::Table(*num));
                         let fs = db.inner.lock()?.versions.fs.clone();
                         fs.remove(table_name.as_str())?;
+                        // self.metric.sub_sst_size();
+                        db.metric.decr_sst_files();
                     }
                 }
                 BGWorkTask::CleanWAL(log_num) => {
@@ -255,6 +267,7 @@ impl<S: Storage, M: MemTable> DB<S, M> {
                         .collect::<Vec<String>>();
                     for wal in wals {
                         fs.remove(wal.as_ref())?;
+                        db.metric.decr_wal_files();
                     }
                 }
             }
@@ -263,13 +276,13 @@ impl<S: Storage, M: MemTable> DB<S, M> {
         let db = self.clone();
         let metric = self.metric.clone();
         std::thread::spawn(move || {
-            metric.threads.fetch_add(1, Relaxed);
+            metric.incr_threads_cnt();
             for t in rx {
                 if let Err(e) = handler(&db, t) {
                     println!("error occurred when handling bg works: {:?}", e);
                 }
             }
-            metric.threads.fetch_sub(1, Relaxed);
+            metric.decr_threads_cnt();
         });
     }
 
@@ -316,10 +329,11 @@ impl<S: Storage, M: MemTable> DB<S, M> {
             let mut old_memdb = std::mem::replace(&mut inner.memdb, new_memdb);
             if let Some(wal) = old_memdb.wal.as_ref() {
                 let wal_seq_num = wal.lock()?.1;
-                if  wal_seq_num > 0 && old_memdb.mem.last_seq_num() < wal_seq_num as u64 {
+                if wal_seq_num > 0 && old_memdb.mem.last_seq_num() < wal_seq_num as u64 {
                     old_memdb.catch_up_with_wal()?;
                 }
             }
+            self.metric.incr_wal_files();
             inner.imem = Some(Arc::new(old_memdb));
             inner.versions.log_number = new_log_number;
             force = false;
@@ -401,10 +415,10 @@ impl<O: Storage, M: MemTable> DB<O, M> {
             }
             (ikey, l.versions.current_version_cloned())
         };
-        match version.get(ikey, &self.opts)? {
-            Some((k, v)) => Ok(k.is_set().then_some(v)),
-            None => Ok(None),
-        }
+        let r = version
+            .get(ikey, &self.opts)?
+            .and_then(|(k, v)| k.is_set().then_some(v));
+        Ok(r)
     }
 
     pub fn del(&self, key: Bytes) -> Result<(), LError> {
@@ -509,7 +523,7 @@ impl<O: Storage, M: MemTable> DB<O, M> {
         // insert the values into the newly opened memdb. Dont worry about data loss because the one who
         // did the convertion has done the pending insertion.
         if inner.memdb.file_num != memdb_num {
-            return Ok(())
+            return Ok(());
         }
         inner.memdb.catch_up_with_wal()
     }
@@ -555,6 +569,41 @@ pub struct Snapshot<O: Storage, M: MemTable> {
 
 pub trait DBScanner {
     fn next(&mut self) -> Result<Option<(InternalKey, Bytes)>, LError>;
+}
+
+pub(crate) struct DedupScanner<'a> {
+    scanner: Box<dyn DBScanner + 'a>,
+    last: Option<InternalKey>,
+    ucmp: ComparatorImpl,
+}
+
+impl<'a> DBScanner for DedupScanner<'a> {
+    fn next(&mut self) -> Result<Option<(InternalKey, Bytes)>, LError> {
+        loop {
+            match self.scanner.next()? {
+                None => return Ok(None),
+                Some((ik, v)) => {
+                    if let Some(k) = self.last.as_ref() {
+                        if self.ucmp.compare(k.ukey(), ik.ukey()) == Ordering::Equal {
+                            continue;
+                        }
+                    }
+                    self.last = Some(ik.clone());
+                    return Ok(Some((ik, v)));
+                }
+            }
+        }
+    }
+}
+
+impl<'a> DedupScanner<'a> {
+    pub(crate) fn new(scanner: Box<dyn DBScanner + 'a>, ucmp: ComparatorImpl) -> Self {
+        Self {
+            scanner,
+            ucmp,
+            last: None,
+        }
+    }
 }
 
 pub(crate) struct ConcatScanner<'a> {
@@ -643,15 +692,15 @@ impl<'a> MergeScanner<'a> {
 
 #[cfg(test)]
 mod test {
-    use std::collections::HashMap;
-    use std::sync::Arc;
-    use bytes::Bytes;
-    use lazy_static::lazy_static;
     use crate::db::DB;
-    use crate::io::{MemFile, StorageSystem, MemFS};
+    use crate::io::{MemFS, MemFile};
     use crate::key::InternalKeyRef;
     use crate::memtable::simple::BTMap;
     use crate::opts::OptsRaw;
+    use bytes::Bytes;
+    use lazy_static::lazy_static;
+    use std::collections::HashMap;
+    use std::sync::Arc;
 
     #[test]
     fn test_reopen_db() {
@@ -666,7 +715,6 @@ mod test {
         }
         let fs = &*TEST_MEM_FS1;
         let db: DB<MemFile, BTMap> = DB::open("test_reopen".to_string(), opts.clone(), fs).unwrap();
-        let mut mem = BTMap::default();
         let mut kvs = HashMap::new();
         for i in 0..10000 {
             let uk = format!("key:{}", i);

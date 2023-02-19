@@ -4,8 +4,8 @@ use std::sync::PoisonError;
 pub mod any;
 pub mod call_on_drop;
 pub mod crc;
-pub mod varint;
 pub mod lru;
+pub mod varint;
 
 #[allow(unused)]
 pub(crate) struct DebugMutex<T> {

@@ -1,5 +1,5 @@
 use crate::compare::ComparatorImpl;
-use crate::db::{BGWorkTask, ConcatScanner, DBScanner, MergeScanner, DB};
+use crate::db::{BGWorkTask, ConcatScanner, DBScanner, DedupScanner, MergeScanner, DB};
 use crate::filename::{db_filename, FileType};
 use crate::io::Storage;
 use crate::key::{InternalKey, InternalKeyComparator, InternalKeyKind, InternalKeyRef};
@@ -9,12 +9,10 @@ use crate::sstable::writer::SSTableWriter;
 use crate::utils::call_on_drop::CallOnDrop;
 use crate::version::{ikey_range, DataFile, DataFilePtr, VersionEdit, VersionPtr, LEVELS};
 use crate::{call_on_drop, unregister, LError};
-use std::cmp::Ordering;
 
 use bytes::Bytes;
 use crossbeam::channel::unbounded;
 use std::fmt::{Debug, Formatter};
-use std::sync::atomic::Ordering::Relaxed;
 
 const TARGET_FILE_SIZE: u64 = 2 * 1024 * 1024;
 const MAX_GRANDPARENT_OVERLAP_BYTES: u64 = 10 * TARGET_FILE_SIZE;
@@ -46,11 +44,14 @@ impl<S: Storage> Compaction<S> {
             level: 0,
             inputs: vec![vec![], vec![], vec![]],
         };
-        if let Some((level, _)) = version.compaction.and_then(|(l, s)| (s >= 1.0).then_some((l, s))) {
-                // we pick this level because there are too much data in this level.
-                // and we just start from the first file in this group.
-                c.level = level;
-                c.inputs[0] = vec![version.files_in_level(level)[0].clone()];
+        if let Some((level, _)) = version
+            .compaction
+            .and_then(|(l, s)| (s >= 1.0).then_some((l, s)))
+        {
+            // we pick this level because there are too much data in this level.
+            // and we just start from the first file in this group.
+            c.level = level;
+            c.inputs[0] = vec![version.files_in_level(level)[0].clone()];
         } else if version.seek_compact.is_some() {
             let (file, level) = version.seek_compact.as_ref().unwrap();
             c.level = *level;
@@ -256,13 +257,14 @@ impl<O: Storage, M: MemTable> DB<O, M> {
             file: Some(reader),
             key_stream: Some(tx),
         };
+        self.metric.incr_opened_files();
         let dfp = DataFilePtr::new(df);
         let file = dfp.file.clone();
         let metric = self.metric.clone();
         std::thread::spawn(move || {
-            metric.threads.fetch_add(1, Relaxed);
+            metric.incr_threads_cnt();
             DataFile::serve_queries(file, rx);
-            metric.threads.fetch_sub(1, Relaxed);
+            metric.decr_threads_cnt();
         });
         ve.new_file(0, dfp);
         ve.set_log_number(log_num);
@@ -291,7 +293,11 @@ impl<O: Storage, M: MemTable> DB<O, M> {
         };
         let scanner1: Box<dyn DBScanner> =
             Box::new(ConcatScanner::from(files2scanner(&c.inputs[1])));
-        let mut scanner = MergeScanner::new(self.icmp.clone(), vec![scanner0, scanner1]);
+        let scanner = Box::new(MergeScanner::new(
+            self.icmp.clone(),
+            vec![scanner0, scanner1],
+        ));
+        let mut scanner = DedupScanner::new(scanner, self.ucmp);
 
         let mut smallest = None;
         let mut prev_key: Option<InternalKey> = None;
@@ -299,13 +305,6 @@ impl<O: Storage, M: MemTable> DB<O, M> {
         let mut new_files = vec![];
         let mut tmpfile_recyclers = vec![];
         while let Some((ik, v)) = scanner.next()? {
-            if let Some(prev_k) = prev_key.as_ref() {
-                if self.ucmp.compare(prev_k.ukey(), ik.ukey()) == Ordering::Equal {
-                    // for two internal keys, if their user's part are equal, the one
-                    // with higher sequence number is less than the other.
-                    continue;
-                }
-            }
             smallest = smallest.or(Some(ik.clone()));
             prev_key = Some(ik.clone());
             // no need to keep the deleted key because there are no older versions of SET operation.
@@ -380,21 +379,20 @@ impl<O: Storage, M: MemTable> DB<O, M> {
 #[cfg(test)]
 mod test {
     use crate::db::{DBScanner, DB};
-    use crate::io::{MemFile, Storage, StorageSystem, MEM_FS, MemFS};
+    use crate::io::{MemFS, MemFile, Storage, StorageSystem, MEM_FS};
     use crate::key::InternalKeyRef;
     use crate::memtable::simple::BTMap;
     use crate::memtable::MemTable;
     use crate::opts::OptsRaw;
     use crate::sstable::reader::{SSTableReader, SSTableScanner};
-    use std::collections::HashMap;
-    use std::sync::Arc;
     use bytes::Bytes;
     use lazy_static::lazy_static;
-    use crate::version::{DataFile, DataFilePtr, Version, VersionEdit};
+    use std::collections::HashMap;
+    use std::sync::Arc;
 
     #[test]
     fn test_compact_imem() {
-        let mut  opt_raw: OptsRaw = OptsRaw::default();
+        let opt_raw: OptsRaw = OptsRaw::default();
         let opts = Arc::new(opt_raw);
         lazy_static! {
             pub(crate) static ref TEST_MEM_FS: MemFS = MemFS::default();
@@ -420,7 +418,9 @@ mod test {
             .next();
         assert!(fno.is_some());
         let file_name = fno.unwrap().clone();
-        let mut f = fs.open(format!("./db_dir/{}", file_name.as_str()).as_str()).unwrap();
+        let mut f = fs
+            .open(format!("./db_dir/{}", file_name.as_str()).as_str())
+            .unwrap();
         f.seek(0).unwrap();
         assert!(f.size().unwrap() > 0);
         let r = SSTableReader::open(f, 2, &opts).unwrap();
@@ -439,7 +439,6 @@ mod test {
         let opts = Arc::new(opt_raw);
         let fs = &*MEM_FS as &'static dyn StorageSystem<O = MemFile>;
         let db: DB<MemFile, BTMap> = DB::open("disk_tables".to_string(), opts.clone(), fs).unwrap();
-        let mut mem = BTMap::default();
         let mut kvs = HashMap::new();
         for i in 0..10000 {
             let uk = format!("key:{}", i);
@@ -450,7 +449,6 @@ mod test {
         }
         let r = db.compact1();
         assert!(r.is_ok());
-        let file_list = fs.list("disk_tables").unwrap();
         for (i, v) in kvs.iter() {
             let vv = Bytes::from(v.clone());
             if let Ok(Some(vvv)) = db.get(i.ukey()) {
@@ -459,6 +457,5 @@ mod test {
                 panic!("not equal");
             }
         }
-        // assert!(false);
     }
 }

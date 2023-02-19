@@ -1,7 +1,7 @@
-use std::cmp::max;
 use crate::compare::ComparatorImpl;
 use crate::memtable::MemTable;
 use bytes::Bytes;
+use std::cmp::max;
 use std::collections::BTreeMap;
 
 #[derive(Default, Debug)]
@@ -105,7 +105,7 @@ mod test {
     use crate::memtable::simple::BTMap;
     use crate::memtable::MemTable;
     use bytes::Bytes;
-    use std::collections::{HashMap, HashSet};
+    use std::collections::HashSet;
 
     #[test]
     fn test_btmap() {
@@ -137,7 +137,11 @@ mod test {
         for (k, n, v) in kvs.iter() {
             assert_eq!(
                 m.get(k.as_ref()),
-                if *n % 20 == 0 { Some(None) } else { Some(Some(v.clone())) }
+                if *n % 20 == 0 {
+                    Some(None)
+                } else {
+                    Some(Some(v.clone()))
+                }
             );
         }
         let mut i = m.iter(BYTEWISE_COMPARATOR);

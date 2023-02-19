@@ -10,6 +10,7 @@ pub mod filter;
 pub mod io;
 pub mod key;
 pub mod memtable;
+pub mod metric;
 pub mod opts;
 pub mod sstable;
 pub mod utils;

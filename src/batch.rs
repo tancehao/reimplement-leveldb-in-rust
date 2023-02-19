@@ -19,7 +19,7 @@ impl Batch {
     }
 
     pub fn get_seq_num(&self) -> u64 {
-        self.seq_num & ((1<<56) - 1)
+        self.seq_num & ((1 << 56) - 1)
     }
 
     pub fn count(&self) -> usize {
@@ -136,10 +136,10 @@ impl Encoding for Batch {
 
 #[cfg(test)]
 mod test {
-    use bytes::BytesMut;
     use crate::batch::Batch;
     use crate::io::Encoding;
     use crate::opts::Opts;
+    use bytes::BytesMut;
 
     #[test]
     fn test_batch() {

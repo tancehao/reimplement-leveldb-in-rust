@@ -7,12 +7,12 @@ use crate::sstable::format::{
     read_block_data, read_filter_data, BlockHandle, DataBlock, DataBlockPtr, Filter, Footer,
     IndexBlock,
 };
+use crate::utils::lru::{CacheSize, LRUCache};
 use crate::LError;
 use bytes::Bytes;
 use std::fmt::{Debug, Formatter};
 use std::sync::Arc;
 use std::sync::Mutex;
-use crate::utils::lru::{CacheSize, LRUCache};
 
 pub(crate) type SSTEntry = (InternalKey, Bytes);
 
@@ -99,24 +99,27 @@ impl<S: Storage> SSTableReader<S> {
             Ok(d) => d,
         };
         let db = Arc::new(DataBlock::decode(&mut d, opt)?);
-        self.shared_cache.lock()?.set((self.num, handle), db.clone());
+        self.shared_cache
+            .lock()?
+            .set((self.num, handle), db.clone());
         Ok(db)
     }
 
     pub(crate) fn get(&self, ukey: &[u8], opts: &Opts) -> Result<Option<SSTEntry>, LError> {
-        if let Some(_f) = self.filter.as_ref() {
-            // TODO need to use bloom filter
-        }
         let block_handle = match self.index.search_value(ukey, opts) {
             Ok((_, bh)) => bh,
             Err(Some(bh)) => bh,
             Err(None) => return Ok(None),
         };
+        if let Some(filter) = self.filter.as_ref() {
+            if !filter.may_contain(block_handle.offset(), ukey) {
+                return Ok(None);
+            }
+        }
         let r = self
             .load_block(block_handle, opts)?
             .search_value(ukey, opts);
-        match r
-        {
+        match r {
             Ok((key, val)) => {
                 let ik = InternalKey::try_from(key)?;
                 Ok(Some((ik, val)))
