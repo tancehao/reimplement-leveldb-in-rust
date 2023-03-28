@@ -3,6 +3,52 @@ use crate::opts::Opts;
 use crate::utils::varint::{put_uvarint, take_uvarint};
 use crate::LError;
 use bytes::{BufMut, Bytes, BytesMut};
+use std::sync::{Arc, Condvar, Mutex};
+
+#[derive(Debug, Default)]
+pub struct BatchWriter {
+    batch: Batch,
+    notifier: Arc<(Mutex<bool>, Condvar)>,
+}
+
+impl BatchWriter {
+    pub fn new(batch: Batch) -> Self {
+        Self {
+            batch,
+            notifier: Arc::new((Mutex::new(false), Condvar::new())),
+        }
+    }
+
+    pub(crate) fn notifier(&self) -> Arc<(Mutex<bool>, Condvar)> {
+        self.notifier.clone()
+    }
+
+    pub(crate) fn set_seq_num(&mut self, seq_num: u64) {
+        self.batch.set_seq_num(seq_num);
+    }
+
+    pub(crate) fn write_batch(&self, buf: &mut BytesMut, opts: &Opts) {
+        self.batch.encode(buf, opts);
+    }
+
+    pub(crate) fn batch(&self) -> &Batch {
+        &self.batch
+    }
+
+    pub fn wait_done(&self) -> bool {
+        let mut done = self.notifier.0.lock().unwrap();
+        if *done {
+            return true;
+        }
+        done = self.notifier.1.wait(done).unwrap();
+        return *done;
+    }
+
+    pub(crate) fn notify_done(&self) {
+        *self.notifier.0.lock().unwrap() = true;
+        self.notifier.1.notify_one();
+    }
+}
 
 #[derive(Debug, Clone, Default)]
 pub struct Batch {

@@ -1,3 +1,4 @@
+use crate::compare::Comparator;
 use crate::filter::{BloomFilter, FilterPolicy, BLOOM_FILTER};
 use crate::io::{Encoding, Storage};
 use crate::key::InternalKey;
@@ -45,23 +46,12 @@ impl<S: Storage> SSTableWriter<S> {
         match self.last_key.as_ref() {
             None => {}
             Some(k) => {
-                if let Ordering::Greater =
-                    self.opts.get_comparator().compare(k.as_ref(), key.as_ref())
-                {
+                if let Ordering::Greater = self.opts.get_icmp().compare(k.as_ref(), key.as_ref()) {
                     return Err(LError::Internal(
                         "keys are set in non-increasing order".into(),
                     ));
                 }
             }
-        }
-        let keep = (self.opts.compact_hook.1)(
-            &self.opts.compact_hook.0,
-            key.ukey(),
-            key.seq_num(),
-            (!value.is_empty()).then_some(value.clone()),
-        );
-        if !keep {
-            return Ok(self.offset as usize);
         }
         self.filter.append_key(key.clone());
         self.last_key = Some(key.clone());
@@ -156,7 +146,7 @@ impl<S: Storage> SSTableWriter<S> {
             num: self.num,
             f: Arc::new(Mutex::new(self.file)),
             shared_cache: LRUCache::new(0),
-            index: self.index_block,
+            index: Arc::new(self.index_block),
             filter: filter,
         })
     }

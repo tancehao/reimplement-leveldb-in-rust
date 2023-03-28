@@ -1,6 +1,7 @@
+use crate::compare::{Comparator, ComparatorImpl};
 use crate::filter::{BloomFilter, FilterPolicy, BLOOM_FILTER};
 use crate::io::{Encoding, Storage};
-use crate::key::{InternalKey, InternalKeyRef};
+use crate::key::{InternalKey, InternalKeyComparator};
 use crate::opts::Opts;
 use crate::utils::crc::crc32;
 use crate::utils::varint::{put_uvarint, take_uvarint};
@@ -318,22 +319,6 @@ impl<T: Clone> DecodedBlock<T> {
         self.entries.iter().map(|x| x.len()).sum()
     }
 
-    pub fn search_value(&self, ukey: &[u8], opts: &Opts) -> Result<(Bytes, T), Option<T>> {
-        let comparator = opts.get_comparator();
-        let i = match self.entries.binary_search_by(|x| {
-            comparator.compare(InternalKeyRef::from(x.first.key_delta.as_ref()).ukey, ukey)
-        }) {
-            Err(i) => {
-                if i == 0 {
-                    return Err(None);
-                }
-                i - 1
-            }
-            Ok(i) => i,
-        };
-        self.entries[i].search_value(ukey, opts)
-    }
-
     pub(crate) fn set(&mut self, key: Bytes, value: T, opts: &Opts) {
         if let Some(e) = self.entries.last_mut() {
             if e.len() < opts.get_block_restart_interval() {
@@ -395,6 +380,80 @@ impl DataBlock {
             }
         }
         None
+    }
+}
+
+pub(crate) struct BlockScanner<T: Clone> {
+    block: Arc<DecodedBlock<T>>,
+    entry_group_pos: usize,
+    entry_pos: usize,
+}
+
+impl<T: Clone> From<Arc<DecodedBlock<T>>> for BlockScanner<T> {
+    fn from(block: Arc<DecodedBlock<T>>) -> Self {
+        Self {
+            block,
+            entry_pos: 0,
+            entry_group_pos: 0,
+        }
+    }
+}
+
+impl<T: Clone> BlockScanner<T> {
+    pub(crate) fn seek(&mut self, ikey: &InternalKey, ucmp: ComparatorImpl) {
+        let comparator = InternalKeyComparator::from(ucmp);
+        // which entry group the desired ikey may exist?
+        let i = match self
+            .block
+            .entries
+            .binary_search_by(|x| comparator.compare(x.first.key_delta.as_ref(), ikey.as_ref()))
+        {
+            Err(i) => {
+                if i == 0 {
+                    0
+                } else {
+                    i - 1
+                }
+            }
+            Ok(i) => i,
+        };
+        self.entry_group_pos = i;
+        if self.entry_group_pos == self.block.entries.len() {
+            return;
+        }
+        // search in the entry group
+        let entries = &self.block.entries[self.entry_group_pos];
+        match entries.seek(ikey, comparator) {
+            Ok(i) => {
+                self.entry_pos = i;
+            }
+            Err(mut i) => {
+                if i == 0 {
+                    i = 1;
+                }
+                self.entry_pos = i - 1;
+            }
+        }
+    }
+
+    pub(crate) fn next(&mut self) -> Result<Option<(InternalKey, T)>, LError> {
+        loop {
+            if self.entry_group_pos >= self.block.entries.len() {
+                return Ok(None);
+            }
+            let eg = &self.block.entries[self.entry_group_pos];
+            match eg.get_nth_key(self.entry_pos) {
+                None => {
+                    self.entry_group_pos += 1;
+                    self.entry_pos = 0;
+                }
+                Some(k) => {
+                    let v = eg.get_nth_value(self.entry_pos).unwrap();
+                    self.entry_pos += 1;
+                    return Ok(Some((InternalKey::try_from(k).unwrap(), v)));
+                }
+            }
+        }
     }
 }
 
@@ -463,7 +522,7 @@ impl<T: Encoding + Clone> Encoding for Entry<T> {
 
 #[derive(Clone)]
 pub(crate) struct EntryGroup<T: Clone> {
-    first: Entry<T>,
+    pub(crate) first: Entry<T>,
     following: Vec<Entry<T>>,
 }
 
@@ -509,18 +568,15 @@ impl<T: Clone> EntryGroup<T> {
         }
     }
 
-    pub(crate) fn search_value(&self, ukey: &[u8], opts: &Opts) -> Result<(Bytes, T), Option<T>> {
-        let c = opts.get_comparator();
-        let first_key = InternalKeyRef::from(self.first.key_delta.as_ref());
-        match c.compare(first_key.ukey, ukey) {
+    pub(crate) fn seek(
+        &self,
+        ikey: &InternalKey,
+        c: InternalKeyComparator,
+    ) -> Result<usize, usize> {
+        match c.compare(self.first.key_delta.as_ref(), ikey.as_ref()) {
             Ordering::Less => {}
-            Ordering::Equal => {
-                return Ok((
-                    self.first.key_delta.clone().into(),
-                    self.first.value.clone(),
-                ))
-            }
-            Ordering::Greater => return Err(None),
+            Ordering::Equal => return Ok(0),
+            Ordering::Greater => return Err(0),
         }
         let find_result = self.following.binary_search_by(|x| {
             let x_full_key = x.get_full_key(self.first.key_delta.as_ref());
@@ -528,18 +584,13 @@ impl<T: Clone> EntryGroup<T> {
                 Ok(k) => k,
                 Err(_e) => return Ordering::Less,
             };
-            c.compare(ik.ukey(), ukey)
+            c.compare(ik.as_ref(), ikey.as_ref())
         });
 
         match find_result {
-            Err(0) => Err(Some(self.first.value.clone())),
-            Err(i) => Err(Some(self.following[i - 1].value.clone())),
-            Ok(i) => {
-                let key = self.following[i]
-                    .get_full_key(self.first.key_delta.as_ref())
-                    .clone();
-                Ok((key, self.following[i].value.clone()))
-            }
+            Err(0) => Err(1),
+            Err(i) => Err(i + 1),
+            Ok(i) => Ok(i + 1),
         }
     }
 
@@ -667,13 +718,15 @@ impl Filter {
 
 #[cfg(test)]
 mod tests {
-    use crate::key::{InternalKey, InternalKeyRef};
+    use crate::key::{InternalKey, InternalKeyComparator, InternalKeyRef};
     use crate::opts::{Opts, OptsRaw};
     use crate::sstable::format::{
-        BlockHandle, DecodedBlock, Encoding, Entry, EntryGroup, FilterBlock, Footer, IndexBlock,
+        BlockHandle, BlockScanner, DecodedBlock, Encoding, Entry, EntryGroup, FilterBlock, Footer,
+        IndexBlock,
     };
     use bytes::{Bytes, BytesMut};
     use once_cell::sync::OnceCell;
+    use std::sync::Arc;
 
     #[test]
     fn test_footer() {
@@ -737,17 +790,22 @@ mod tests {
             eg.push_value(k.borrow_inner().clone(), v.clone(), &opts);
         }
         assert_eq!(eg.len(), 89);
-        let ukey = "key:10".as_bytes();
+        let ikey = InternalKeyRef::from(("key:10".as_bytes(), 10)).to_owned();
+        let c = InternalKeyComparator::from(opts.get_ucmp());
+        let i = eg.seek(&ikey, c).unwrap();
+        assert_eq!(eg.get_nth_key(i), Some(ikey.as_ref().to_vec().into()));
         assert_eq!(
-            eg.search_value(ukey.as_ref(), &opts).map(|(_, v)| v),
-            Ok(Bytes::from("value:10".to_string()))
+            eg.get_nth_value(i),
+            Some(Bytes::from("value:10".to_string()))
         );
+
         for i in 1..89 {
+            let p = eg.seek(&kvs[i - 1].0, c).unwrap();
             assert_eq!(
-                eg.search_value(&kvs[i - 1].0.ukey(), &opts)
-                    .map(|(ikb, v)| (InternalKey::try_from(ikb).unwrap(), v)),
-                Ok(kvs[i - 1].clone())
-            )
+                eg.get_nth_key(p),
+                Some(kvs[i - 1].0.as_ref().to_vec().into())
+            );
+            assert_eq!(eg.get_nth_value(p), Some(kvs[i - 1].1.clone()));
         }
         let mut buf = BytesMut::new();
         eg.encode(&mut buf, &opts);
@@ -776,17 +834,16 @@ mod tests {
             db.set(k.borrow_inner().clone(), v.clone(), &opts);
         }
         assert_eq!(db.len(), 88);
+        let db = Arc::new(db);
+        let mut scanner = BlockScanner::from(db.clone());
         for i in 0..88 {
             assert_eq!(
                 db.get_nth_entry(i)
                     .map(|(kk, v)| (InternalKey::try_from(kk).unwrap(), v)),
                 Some(kvs[i].clone())
             );
-            assert_eq!(
-                db.search_value(&kvs[i].0.ukey(), &opts)
-                    .map(|(kk, v)| (InternalKey::try_from(kk).unwrap(), v)),
-                Ok(kvs[i].clone())
-            );
+            scanner.seek(&kvs[i].0, opts.get_ucmp());
+            assert_eq!(scanner.next().unwrap(), Some(kvs[i].clone()));
         }
         let mut buf = BytesMut::new();
         db.encode(&mut buf, &opts);
@@ -814,12 +871,12 @@ mod tests {
         for (key, bh) in bhs.iter() {
             ib.set(key.borrow_inner().clone(), bh.clone(), &opts);
         }
+        let ib = Arc::new(ib);
+        let mut scanner = BlockScanner::from(ib.clone());
         for i in 0..99 {
             assert_eq!(ib.get_nth_block_handle(i), Some(bhs[i].1));
-            assert_eq!(
-                ib.search_value(&bhs[i].0.ukey(), &opts).map(|(_, bh)| bh),
-                Ok(bhs[i].1)
-            );
+            scanner.seek(&bhs[i].0, opts.get_ucmp());
+            assert_eq!(scanner.next().unwrap(), Some(bhs[i].clone()));
         }
         let mut buf = BytesMut::new();
         ib.encode(&mut buf, &opts);

@@ -18,15 +18,11 @@ impl MemTable for SkipList {
         todo!()
     }
 
-    fn get(&self, _key: &[u8]) -> Option<Option<Bytes>> {
+    fn get(&self, _key: &[u8], _snapshot: u64) -> Option<Option<Bytes>> {
         todo!()
     }
 
-    fn set(&mut self, _key: Bytes, _seq_num: u64, _value: Bytes) {
-        todo!()
-    }
-
-    fn del(&mut self, _key: Bytes, _seq_num: u64) {
+    fn set(&mut self, _key: Bytes, _seq_num: u64, _value: Option<Bytes>) {
         todo!()
     }
 

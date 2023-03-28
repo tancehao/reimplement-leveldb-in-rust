@@ -1,24 +1,28 @@
-use crate::batch::Batch;
+use crate::batch::{Batch, BatchWriter};
 use crate::compare::{Comparator, ComparatorImpl};
 use crate::filename::{db_filename, parse_dbname, set_current_file, FileType};
 use crate::io::{Encoding, Storage, StorageSystem};
 use crate::key::{InternalKey, InternalKeyComparator, InternalKeyRef};
 use crate::memtable::MemTable;
-use crate::metric::Metric;
-use crate::opts::Opts;
+use crate::metric::{Metric, COSTS};
+use crate::opts::{Opts, ReadOptions, WriteOptions};
 use crate::utils::call_on_drop::CallOnDrop;
 use crate::version::{VersionEdit, VersionSet, LEVELS};
 use crate::wal::{WalReader, WalWriter};
 use crate::{call_on_drop, unregister, LError, L0_SLOWDOWN_WRITES_TRIGGER, L0_STOP_WRITES_TRIGGER};
 use bytes::{Bytes, BytesMut};
 use crossbeam::channel::{unbounded, Receiver, Sender};
+use crossbeam::queue::SegQueue;
 use std::cmp::{max, Ordering};
-use std::collections::{HashSet, VecDeque};
+use std::collections::btree_set::BTreeSet;
+use std::collections::vec_deque::VecDeque;
+use std::collections::{HashMap, HashSet};
 use std::ops::Deref;
 use std::path::Path;
 use std::sync::atomic::Ordering::Relaxed;
-use std::sync::{Arc, Mutex, RwLock};
-use std::time::Duration;
+use std::sync::{Arc, Condvar, Mutex};
+use std::thread::ThreadId;
+use std::time::{Duration, Instant};
 
 pub struct DB<S: Storage, M: MemTable> {
     pub(crate) dirname: String,
@@ -26,9 +30,11 @@ pub struct DB<S: Storage, M: MemTable> {
     pub(crate) ucmp: ComparatorImpl,
     pub(crate) icmp: InternalKeyComparator,
     pub(crate) inner: Arc<Mutex<DBInner<S, M>>>,
+    pub(crate) write_tx: Arc<SegQueue<BatchWriter>>,
+    pub(crate) write_rx: Arc<Mutex<(Option<BatchWriter>, Arc<SegQueue<BatchWriter>>)>>,
     #[allow(unused)]
     pub(crate) file_lock: Arc<Mutex<Box<dyn Send>>>,
-    pub(crate) compactioning: Arc<RwLock<()>>,
+    pub(crate) compacting_imem: Arc<(Mutex<bool>, Condvar)>,
     pub(crate) bgwork_trigger: Sender<BGWorkTask>,
     pub(crate) metric: Metric,
 }
@@ -48,8 +54,10 @@ impl<S: Storage, M: MemTable> Clone for DB<S, M> {
             ucmp: self.ucmp.clone(),
             icmp: self.icmp.clone(),
             inner: self.inner.clone(),
+            write_tx: self.write_tx.clone(),
+            write_rx: self.write_rx.clone(),
             file_lock: Arc::new(Mutex::new(Box::new(vec![0]))),
-            compactioning: self.compactioning.clone(),
+            compacting_imem: self.compacting_imem.clone(),
             bgwork_trigger: self.bgwork_trigger.clone(),
             metric: Metric::default(),
         }
@@ -60,7 +68,7 @@ pub(crate) struct MemDB<M: MemTable, S: Storage> {
     mem: M,
     file_num: u64,
     wal: Option<Arc<Mutex<(WalWriter<S>, i64)>>>,
-    batch_buf: Arc<Mutex<VecDeque<Batch>>>,
+    batch_buf: VecDeque<BatchWriter>,
 }
 
 impl<M: MemTable, S: Storage> Deref for MemDB<M, S> {
@@ -76,26 +84,14 @@ impl<M: MemTable, S: Storage> MemDB<M, S> {
         self.file_num
     }
 
-    fn catch_up_with_wal(&mut self) -> Result<(), LError> {
-        let mut buf = self.batch_buf.lock()?;
-        loop {
-            match buf.pop_front() {
-                None => return Ok(()),
-                Some(batch) => {
-                    if !batch.get_wal_written() {
-                        buf.push_front(batch);
-                        return Ok(());
-                    } else {
-                        for (seq_num, k, v) in batch.iter() {
-                            match v {
-                                Some(val) => self.mem.set(k.clone(), seq_num, val.clone()),
-                                None => self.mem.del(k.clone(), seq_num),
-                            }
-                        }
-                    }
-                }
+    fn catch_up_with_wal(&mut self, _ctx: &mut Context) -> Result<(), LError> {
+        while let Some(bwp) = self.batch_buf.pop_front() {
+            for (seq_num, k, v) in bwp.batch().iter() {
+                self.mem.set(k.clone(), seq_num, v.cloned());
             }
+            bwp.notify_done();
         }
+        Ok(())
     }
 }
 
@@ -104,6 +100,8 @@ pub(crate) struct DBInner<S: Storage, M: MemTable> {
     pub(crate) memdb: MemDB<M, S>,
     pub(crate) imem: Option<Arc<MemDB<M, S>>>,
     pub(crate) pending_outputs: HashSet<u64>,
+    // pub(crate) snapshots: SnapshotSets,
+    pub(crate) snapshots: (BTreeSet<u64>, Arc<SegQueue<u64>>),
 }
 
 impl<S: Storage, M: MemTable> DB<S, M> {
@@ -120,13 +118,15 @@ impl<S: Storage, M: MemTable> DB<S, M> {
         fs.mkdir_all(dirname.as_str())?;
         let file_lock = fs.lock(db_filename(dirname.as_str(), FileType::Lock).as_str())?;
         let (bgwork_tx, bgwork_rx) = unbounded();
+        let write_queue = Arc::new(SegQueue::new());
+        let snapshot_release_chan = Arc::new(SegQueue::new());
         let metric = Metric::default();
         let db = Self {
             dirname: dirname.clone(),
             opts: opts.clone(),
-            ucmp: opts.get_comparator(),
-            icmp: InternalKeyComparator::from(opts.get_comparator()),
-            compactioning: Arc::new(RwLock::new(())),
+            ucmp: opts.get_ucmp(),
+            icmp: InternalKeyComparator::from(opts.get_ucmp()),
+            compacting_imem: Arc::new((Mutex::new(false), Condvar::new())),
             inner: Arc::new(Mutex::new(DBInner {
                 versions: VersionSet::new(
                     dirname.clone(),
@@ -139,11 +139,15 @@ impl<S: Storage, M: MemTable> DB<S, M> {
                     mem: M::empty(),
                     file_num: 0,
                     wal: None,
-                    batch_buf: Arc::new(Mutex::new(Default::default())),
+                    batch_buf: Default::default(),
                 },
                 imem: None,
                 pending_outputs: Default::default(),
+                snapshots: (BTreeSet::new(), snapshot_release_chan.clone()),
+                // snapshots: SnapshotSets::new(snapshot_release_chan.clone()),
             })),
+            write_tx: write_queue.clone(),
+            write_rx: Arc::new(Mutex::new((None, write_queue))),
             file_lock: Arc::new(Mutex::new(file_lock)),
             bgwork_trigger: bgwork_tx.clone(),
             metric,
@@ -204,6 +208,9 @@ impl<S: Storage, M: MemTable> DB<S, M> {
             -1,
         ))));
         drop(inner);
+        if opts.get_enable_metrics_server() {
+            db.start_metric_server();
+        }
         db.start_bgwork(bgwork_rx);
         Ok(db)
     }
@@ -216,10 +223,7 @@ impl<S: Storage, M: MemTable> DB<S, M> {
             while !d.is_empty() {
                 let batch = Batch::decode(&mut d, &opts)?;
                 for (seq_num, k, v) in batch.iter() {
-                    match v {
-                        Some(value) => inner.memdb.mem.set(k.clone(), seq_num, value.clone()),
-                        None => inner.memdb.mem.del(k.clone(), seq_num),
-                    }
+                    inner.memdb.mem.set(k.clone(), seq_num, v.cloned());
                     max_seq_num = max(max_seq_num, seq_num);
                 }
             }
@@ -227,6 +231,13 @@ impl<S: Storage, M: MemTable> DB<S, M> {
         drop(inner);
         self.compact()?;
         Ok(max_seq_num)
+    }
+
+    fn start_metric_server(&self) {
+        std::thread::spawn(|| {
+            let binding = "127.0.0.1:9184".parse().unwrap();
+            prometheus_exporter::start(binding).unwrap();
+        });
     }
 
     fn start_bgwork(&self, rx: Receiver<BGWorkTask>) {
@@ -241,9 +252,10 @@ impl<S: Storage, M: MemTable> DB<S, M> {
                     for num in nums {
                         let table_name = db_filename(db.dirname.as_str(), FileType::Table(*num));
                         let fs = db.inner.lock()?.versions.fs.clone();
-                        fs.remove(table_name.as_str())?;
-                        // self.metric.sub_sst_size();
-                        db.metric.decr_sst_files();
+                        let _ = fs.remove(table_name.as_str());
+                        if fs.remove(table_name.as_str()).is_ok() {
+                            db.metric.decr_sst_files();
+                        }
                     }
                 }
                 BGWorkTask::CleanWAL(log_num) => {
@@ -266,8 +278,9 @@ impl<S: Storage, M: MemTable> DB<S, M> {
                         .map(|x| format!("{}/{}", db.dirname, x))
                         .collect::<Vec<String>>();
                     for wal in wals {
-                        fs.remove(wal.as_ref())?;
-                        db.metric.decr_wal_files();
+                        if fs.remove(wal.as_ref()).is_ok() {
+                            db.metric.decr_wal_files();
+                        }
                     }
                 }
             }
@@ -286,7 +299,8 @@ impl<S: Storage, M: MemTable> DB<S, M> {
         });
     }
 
-    fn make_room_for_write(&self, mut force: bool) -> Result<(), LError> {
+    fn make_room_for_write(&self, ctx: &mut Context, mut force: bool) -> Result<(), LError> {
+        ctx.start_trace("make_room");
         let mut allow_delay = !force;
         loop {
             let mut inner = self.inner.lock()?;
@@ -304,25 +318,30 @@ impl<S: Storage, M: MemTable> DB<S, M> {
             }
             if inner.imem.is_some() {
                 drop(inner);
-                let _l = self.compactioning.read()?;
+                self.wait_imem_compaction_finish();
                 continue;
             }
             if inner.versions.current_version().file_nums_in_level(0) > L0_STOP_WRITES_TRIGGER {
                 drop(inner);
-                let _g = self.compactioning.read()?;
+                self.wait_imem_compaction_finish();
                 continue;
             }
+            ctx.start_trace("change_wal");
+
             let new_log_number = inner.versions.incr_file_number();
             let new_wal_file = inner.versions.fs.create(
                 db_filename(self.dirname.as_str(), FileType::WAL(new_log_number)).as_str(),
             )?;
             let new_wal_writer = WalWriter::new(new_wal_file);
-            let new_memdb = MemDB {
+            let mut new_memdb = MemDB {
                 mem: M::empty(),
                 file_num: new_log_number,
                 wal: Some(Arc::new(Mutex::new((new_wal_writer, -1)))),
-                batch_buf: inner.memdb.batch_buf.clone(),
+                batch_buf: VecDeque::new(),
             };
+            for snapshot in inner.snapshots.0.iter() {
+                new_memdb.mem.snapshot_acquired(*snapshot);
+            }
             // somebody may be holding a pointer of the wal and writing logs into it, and we cannot
             // replace the memdb now otherwise the logs are written to an old WAL while inserted into
             // a new mem store. So we must hold a lock before doing the replace
@@ -330,15 +349,17 @@ impl<S: Storage, M: MemTable> DB<S, M> {
             if let Some(wal) = old_memdb.wal.as_ref() {
                 let wal_seq_num = wal.lock()?.1;
                 if wal_seq_num > 0 && old_memdb.mem.last_seq_num() < wal_seq_num as u64 {
-                    old_memdb.catch_up_with_wal()?;
+                    old_memdb.catch_up_with_wal(ctx)?;
                 }
             }
             self.metric.incr_wal_files();
             inner.imem = Some(Arc::new(old_memdb));
             inner.versions.log_number = new_log_number;
             force = false;
+            ctx.end_trace("change_wal");
             self.maybe_schedule_compaction();
         }
+        ctx.end_trace("make_room");
         Ok(())
     }
 
@@ -401,36 +422,49 @@ impl<S: Storage, M: MemTable> DB<S, M> {
 
 // exported methods
 impl<O: Storage, M: MemTable> DB<O, M> {
-    pub fn get(&self, key: &[u8]) -> Result<Option<Bytes>, LError> {
+    pub fn get(&self, opts: &ReadOptions, key: &[u8]) -> Result<Option<Bytes>, LError> {
         let (ikey, version) = {
             let l = self.inner.lock()?;
-            let ikey = InternalKeyRef::from((key, l.versions.last_sequence()));
-            if let Some(v) = l.memdb.get(key) {
-                return Ok(v);
+            let snapshot = match opts.snapshot() {
+                Some(o) => o.seq_num(),
+                None => l.versions.last_sequence(),
+            };
+
+            if let Some(Some(v)) = l.memdb.get(key, snapshot) {
+                return Ok(Some(v));
             }
             if let Some(im) = &l.imem {
-                if let Some(v) = im.get(key) {
-                    return Ok(v);
+                if let Some(Some(v)) = im.get(key, snapshot) {
+                    return Ok(Some(v));
                 }
             }
-            (ikey, l.versions.current_version_cloned())
+            (
+                InternalKeyRef::from((key, snapshot)).to_owned(),
+                l.versions.current_version_cloned(),
+            )
         };
-        let r = version
-            .get(ikey, &self.opts)?
-            .and_then(|(k, v)| k.is_set().then_some(v));
-        Ok(r)
+
+        if let Some((ik, val)) = version.get(ikey.clone(), &self.opts)? {
+            if self.opts.get_ucmp().compare(ik.ukey(), ikey.ukey()) == Ordering::Equal {
+                if ik.is_set() {
+                    return Ok(Some(val));
+                }
+            }
+        }
+
+        Ok(None)
     }
 
-    pub fn del(&self, key: Bytes) -> Result<(), LError> {
+    pub fn del(&self, opts: &WriteOptions, key: Bytes) -> Result<(), LError> {
         let mut batch = Batch::default();
         batch.delete(key);
-        self.apply(batch)
+        self.apply_inner(opts, batch)
     }
 
-    pub fn set(&self, key: Bytes, value: Bytes) -> Result<(), LError> {
+    pub fn set(&self, opts: &WriteOptions, key: Bytes, value: Bytes) -> Result<(), LError> {
         let mut batch = Batch::default();
         batch.set(key, value);
-        self.apply(batch)
+        self.apply_inner(opts, batch)
     }
 
     // FIXME: should return a struct and it's the caller's responsibility to display
@@ -479,58 +513,90 @@ impl<O: Storage, M: MemTable> DB<O, M> {
         Ok(info)
     }
 
-    pub fn apply(&self, mut batch: Batch) -> Result<(), LError> {
-        self.make_room_for_write(false)?;
-
-        let mut inner = self.inner.lock()?;
-        let memdb_num = inner.memdb.file_num;
-        let batch_buf = inner.memdb.batch_buf.clone();
-        let wal = inner.memdb.wal.clone();
-        let seq_num = inner.versions.last_sequence() + 1;
-        batch.set_seq_num(seq_num);
-        inner.versions.advance_last_sequence(batch.count() as u64);
-        drop(inner);
-        batch_buf.lock()?.push_back(batch.clone());
-        let mut max_seq_num = 0u64;
-        if let Some(wal) = wal {
-            let mut wal_writer = wal.lock()?;
-            let mut buf = batch_buf.lock()?;
-            let mut log = BytesMut::new();
-            for batch in buf.iter_mut() {
-                if batch.get_wal_written() || batch.get_wal_buffered() {
-                    continue;
-                }
-                // TODO stop encoding a batch if the log's length is greater than BLOCK_SIZE
-                batch.encode(&mut log, &self.opts);
-                batch.set_wal_buffered();
-                max_seq_num = max(max_seq_num, batch.get_seq_num());
-            }
-            wal_writer.0.append(log.as_ref())?;
-            if self.opts.get_flush_wal() {
-                wal_writer.0.flush()?;
-            }
-            for batch in buf.iter_mut() {
-                if batch.get_wal_buffered() {
-                    batch.set_wal_written();
-                }
-            }
-            wal_writer.1 = max(max_seq_num as i64, wal_writer.1);
-            drop(wal_writer);
-            drop(buf);
-        }
-        inner = self.inner.lock()?;
-        // the memdb has been converted to the imutual one when we were writing into WAL, and we should not
-        // insert the values into the newly opened memdb. Dont worry about data loss because the one who
-        // did the convertion has done the pending insertion.
-        if inner.memdb.file_num != memdb_num {
-            return Ok(());
-        }
-        inner.memdb.catch_up_with_wal()
+    pub fn apply(&self, opts: &WriteOptions, batch: Batch) -> Result<(), LError> {
+        self.apply_inner(opts, batch)
     }
 
-    #[allow(unused)]
-    pub fn snapshot(&self) -> Result<Snapshot<O, M>, LError> {
-        Err(LError::Internal("unimplemented".into()))
+    pub(crate) fn apply_inner(&self, opts: &WriteOptions, batch: Batch) -> Result<(), LError> {
+        let mut ctx = Context::default();
+        self.make_room_for_write(&mut ctx, false)?;
+
+        let batch_writer = BatchWriter::new(batch);
+        let notifier = batch_writer.notifier();
+        self.write_tx.push(batch_writer);
+        loop {
+            match self.write_rx.try_lock() {
+                Err(_) => {
+                    let mut done = notifier.0.lock().unwrap();
+                    if *done {
+                        return Ok(());
+                    }
+                    done = notifier.1.wait(done).unwrap();
+                    if *done {
+                        return Ok(());
+                    }
+                }
+                Ok(mut rx) => {
+                    let mut log = BytesMut::new();
+                    let mut bws = VecDeque::new();
+                    let mut inner = self.inner.lock()?;
+                    if let Some(mut bw) = rx.0.take() {
+                        bw.set_seq_num(inner.versions.last_sequence());
+                        inner
+                            .versions
+                            .advance_last_sequence(bw.batch().count() as u64);
+                        bw.write_batch(&mut log, &self.opts);
+                        bws.push_back(bw);
+                    }
+                    while let Some(mut bw) = rx.1.pop() {
+                        bw.set_seq_num(inner.versions.last_sequence());
+                        inner
+                            .versions
+                            .advance_last_sequence(bw.batch().count() as u64);
+                        bw.write_batch(&mut log, &self.opts);
+                        bws.push_back(bw);
+                    }
+                    let (memdb_num, wal) = (inner.memdb.file_num, inner.memdb.wal.clone());
+                    drop(inner);
+                    if let Some(v) = wal {
+                        let mut wal = v.lock()?;
+                        wal.0.append(log.as_ref())?;
+                        let sync = opts.sync().unwrap_or(self.opts.get_flush_wal());
+                        if sync {
+                            wal.0.flush()?;
+                        }
+                    }
+                    let mut inner = self.inner.lock()?;
+                    if inner.memdb.file_num != memdb_num {
+                        return Ok(());
+                    }
+                    {
+                        while let Some(seq_num) = inner.snapshots.1.pop() {
+                            inner.snapshots.0.remove(&seq_num);
+                            inner.memdb.mem.snapshot_released(seq_num);
+                        }
+                    }
+                    inner.memdb.batch_buf = bws;
+                    inner.memdb.catch_up_with_wal(&mut ctx)?;
+                    if let Some(bw) = rx.1.pop() {
+                        bw.notify_done();
+                        rx.0 = Some(bw);
+                    }
+                    return Ok(());
+                }
+            }
+        }
+    }
+
+    pub fn snapshot(&self) -> Snapshot {
+        let mut inner = self.inner.lock().unwrap();
+        let seq_num = inner.versions.last_sequence;
+        inner.snapshots.0.insert(seq_num);
+        inner.memdb.mem.snapshot_acquired(seq_num);
+        Snapshot {
+            seq_num: seq_num,
+            release_queue: inner.snapshots.1.clone(),
+        }
     }
 
     #[allow(unused)]
@@ -542,29 +608,24 @@ impl<O: Storage, M: MemTable> DB<O, M> {
     pub fn dump<D: AsRef<Path>>(&self, target_dir: D) -> Result<(), LError> {
         Err(LError::Internal("unimplemented".into()))
     }
+}
 
-    #[allow(unused)]
-    pub fn watch_event(&self, event_type: EventType) -> Result<(), LError> {
-        Err(LError::Internal("unimplemented".into()))
+#[derive(Clone, Debug)]
+pub struct Snapshot {
+    seq_num: u64,
+    release_queue: Arc<SegQueue<u64>>,
+}
+
+impl Snapshot {
+    pub fn seq_num(&self) -> u64 {
+        self.seq_num
     }
 }
 
-#[derive(Copy, Clone, Debug)]
-pub enum EventType {
-    Opened,
-    WalWrote,
-    MemFreezed,
-    ImemCompacted,
-    SSTCompacted,
-    NewSSTAdded,
-    SSTRemoved,
-    Closed,
-}
-
-#[allow(unused)]
-pub struct Snapshot<O: Storage, M: MemTable> {
-    seq_num: u64,
-    db: DB<O, M>,
+impl Drop for Snapshot {
+    fn drop(&mut self) {
+        self.release_queue.push(self.seq_num);
+    }
 }
 
 pub trait DBScanner {
@@ -597,6 +658,7 @@ impl<'a> DBScanner for DedupScanner<'a> {
 }
 
 impl<'a> DedupScanner<'a> {
+    #[allow(unused)]
     pub(crate) fn new(scanner: Box<dyn DBScanner + 'a>, ucmp: ComparatorImpl) -> Self {
         Self {
             scanner,
@@ -696,7 +758,7 @@ mod test {
     use crate::io::{MemFS, MemFile};
     use crate::key::InternalKeyRef;
     use crate::memtable::simple::BTMap;
-    use crate::opts::OptsRaw;
+    use crate::opts::{OptsRaw, ReadOptions, WriteOptions};
     use bytes::Bytes;
     use lazy_static::lazy_static;
     use std::collections::HashMap;
@@ -704,6 +766,7 @@ mod test {
 
     #[test]
     fn test_reopen_db() {
+        let (ro, wo) = (ReadOptions::default(), WriteOptions::default());
         let mut opt_raw: OptsRaw = OptsRaw::default();
         opt_raw.write_buffer_size = 256;
         opt_raw.block_size = 512;
@@ -716,23 +779,23 @@ mod test {
         let fs = &*TEST_MEM_FS1;
         let db: DB<MemFile, BTMap> = DB::open("test_reopen".to_string(), opts.clone(), fs).unwrap();
         let mut kvs = HashMap::new();
-        for i in 0..10000 {
+        for i in 1..10000 {
             let uk = format!("key:{}", i);
             let value = format!("value:{}:{}:{}", i, i, i);
             let ik = InternalKeyRef::from((uk.as_ref(), i)).to_owned();
             if i % 20 == 0 {
                 kvs.insert(ik, None);
-                assert!(db.del(uk.into()).is_ok());
+                assert!(db.del(&wo, uk.into()).is_ok());
             } else {
                 kvs.insert(ik, Some(value.clone()));
-                assert!(db.set(uk.into(), value.into()).is_ok());
+                assert!(db.set(&wo, uk.into(), value.into()).is_ok());
             }
         }
         drop(db);
         let db: DB<MemFile, BTMap> = DB::open("test_reopen".to_string(), opts.clone(), fs).unwrap();
         for (k, v) in kvs.iter() {
             let vv = v.clone().map(|x| Bytes::from(x));
-            assert_eq!(db.get(k.ukey()).unwrap(), vv);
+            assert_eq!(db.get(&ro, k.ukey()).unwrap(), vv);
         }
     }
 
@@ -741,4 +804,69 @@ mod test {
 
     #[test]
     fn test_merging_scanner() {}
+}
+
+#[cfg(debug_assertions)]
+pub(crate) type Context = ContextImpl;
+
+#[cfg(not(debug_assertions))]
+pub(crate) type Context = EmptyContext;
+
+#[derive(Clone, Debug)]
+pub struct ContextImpl {
+    #[allow(unused)]
+    thread_id: ThreadId,
+    #[allow(unused)]
+    trace: HashMap<&'static str, Instant>,
+    metrics: HashMap<&'static str, u128>,
+}
+
+impl Default for ContextImpl {
+    fn default() -> Self {
+        Self {
+            thread_id: std::thread::current().id(),
+            trace: HashMap::new(),
+            metrics: HashMap::new(),
+        }
+    }
+}
+
+impl ContextImpl {
+    #[allow(unused)]
+    pub(crate) fn start_trace(&mut self, name: &'static str) {
+        self.trace.insert(name, Instant::now());
+    }
+
+    #[allow(unused)]
+    pub(crate) fn end_trace(&mut self, name: &'static str) {
+        match self.trace.get(name) {
+            None => panic!("trace unstarted"),
+            Some(v) => {
+                let s = Instant::now().duration_since(*v).as_nanos();
+                self.metrics.insert(name, s);
+                self.trace.remove(name);
+            }
+        }
+    }
+}
+
+impl Drop for ContextImpl {
+    fn drop(&mut self) {
+        for (m, c) in self.metrics.iter() {
+            if let Some(hist) = COSTS.get(m) {
+                hist.observe(*c as f64);
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct EmptyContext {}
+
+impl EmptyContext {
+    #[allow(unused)]
+    pub(crate) fn start_trace(&mut self, _name: &'static str) {}
+
+    #[allow(unused)]
+    pub(crate) fn end_trace(&mut self, _name: &'static str) {}
 }

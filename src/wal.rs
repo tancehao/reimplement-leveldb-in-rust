@@ -41,7 +41,6 @@ impl<T: Storage> WalReader<T> {
                 let mut buf = BytesMut::with_capacity(BLOCK_SIZE);
                 buf.resize(BLOCK_SIZE, 0);
                 self.f.read(&mut buf)?;
-                // println!("buf after read from wal: {:?}", buf);
                 self.buf = buf.freeze();
                 self.read_times += 1;
                 self.read_size += BLOCK_SIZE as u64;
@@ -59,7 +58,6 @@ impl<T: Storage> WalReader<T> {
                 continue;
             }
             let data = self.buf.split_to(length as usize);
-            // println!("self.buf length after split_to: {}, t: {}, data: {:?}", self.buf.len(), t, data);
             if crc32(data.as_ref()) != checksum {
                 return Err(LError::InvalidFile(format!(
                     "data in file {} is malformed",
@@ -107,7 +105,6 @@ impl<T: Storage> WalWriter<T> {
     fn write_buf(&mut self) -> Result<(), LError> {
         while let Some(mut buf) = self.buf.pop_front() {
             if buf.len() > 0 {
-                // println!("writing buf to file: {:?}", buf);
                 self.f.write_all(buf.as_ref())?;
                 let _ = buf.split_to(buf.len());
             }

@@ -1,6 +1,6 @@
 use crate::compare::{ComparatorImpl, BYTEWISE_COMPARATOR};
-use crate::utils::any::Any;
-use bytes::Bytes;
+use crate::db::Snapshot;
+use crate::key::InternalKeyComparator;
 use std::sync::Arc;
 
 pub type Opts = Arc<OptsRaw>;
@@ -16,9 +16,9 @@ pub struct OptsRaw {
     pub error_if_db_exists: bool,
     pub write_buffer_size: u64,
     pub max_file_size: u64,
-    pub compact_hook: (Any, CompactHook),
     pub flush_wal: bool,
     pub tiered_parallel: bool,
+    pub enable_metrics_server: bool,
 }
 
 pub fn default_opts() -> Opts {
@@ -38,16 +38,20 @@ impl Default for OptsRaw {
             error_if_db_exists: false,
             write_buffer_size: 4 * 1024 * 1024,
             max_file_size: 4 * 1024 * 1024,
-            compact_hook: (Any::new(()), empty_compact_hook),
             flush_wal: true,
             tiered_parallel: true,
+            enable_metrics_server: true,
         }
     }
 }
 
 impl OptsRaw {
-    pub fn get_comparator(&self) -> ComparatorImpl {
+    pub fn get_ucmp(&self) -> ComparatorImpl {
         self.comparer
+    }
+
+    pub fn get_icmp(&self) -> InternalKeyComparator {
+        InternalKeyComparator { u: self.comparer }
     }
 
     pub fn get_block_restart_interval(&self) -> usize {
@@ -86,10 +90,6 @@ impl OptsRaw {
         self.max_file_size
     }
 
-    pub fn get_compact_hook(&self) -> CompactHook {
-        self.compact_hook.1
-    }
-
     pub fn get_flush_wal(&self) -> bool {
         self.flush_wal
     }
@@ -97,9 +97,66 @@ impl OptsRaw {
     pub fn get_tiered_parallel(&self) -> bool {
         self.tiered_parallel
     }
+
+    pub fn get_enable_metrics_server(&self) -> bool {
+        self.enable_metrics_server
+    }
 }
 
-type CompactHook = fn(&Any, &[u8], u64, Option<Bytes>) -> bool;
-pub fn empty_compact_hook(_a: &Any, _uk: &[u8], _seq_num: u64, _value: Option<Bytes>) -> bool {
-    true
+#[derive(Clone, Debug)]
+pub struct ReadOptions {
+    snapshot: Option<Snapshot>,
+    verify_checksum: bool,
+    fill_cache: bool,
+}
+
+impl Default for ReadOptions {
+    fn default() -> Self {
+        ReadOptions {
+            snapshot: None,
+            verify_checksum: true,
+            fill_cache: true,
+        }
+    }
+}
+
+impl ReadOptions {
+    pub fn set_verify_checksum(&mut self, v: bool) {
+        self.verify_checksum = v;
+    }
+
+    pub fn set_fill_cache(&mut self, v: bool) {
+        self.fill_cache = v;
+    }
+
+    pub fn set_snapshot(&mut self, snapshot: Snapshot) {
+        self.snapshot = Some(snapshot);
+    }
+
+    pub fn snapshot(&self) -> Option<&Snapshot> {
+        self.snapshot.as_ref()
+    }
+
+    pub fn verify_checksum(&self) -> bool {
+        self.verify_checksum
+    }
+
+    pub fn fill_cache(&self) -> bool {
+        self.fill_cache
+    }
+}
+
+#[derive(Default, Clone, Debug)]
+pub struct WriteOptions {
+    sync: Option<bool>,
+}
+
+impl WriteOptions {
+    pub fn sync(&self) -> Option<bool> {
+        self.sync
+    }
+
+    pub fn set_sync(&mut self, s: bool) {
+        self.sync = Some(s);
+    }
 }

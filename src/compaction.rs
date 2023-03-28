@@ -1,5 +1,5 @@
 use crate::compare::ComparatorImpl;
-use crate::db::{BGWorkTask, ConcatScanner, DBScanner, DedupScanner, MergeScanner, DB};
+use crate::db::{BGWorkTask, ConcatScanner, DBScanner, MergeScanner, DB};
 use crate::filename::{db_filename, FileType};
 use crate::io::Storage;
 use crate::key::{InternalKey, InternalKeyComparator, InternalKeyKind, InternalKeyRef};
@@ -9,10 +9,13 @@ use crate::sstable::writer::SSTableWriter;
 use crate::utils::call_on_drop::CallOnDrop;
 use crate::version::{ikey_range, DataFile, DataFilePtr, VersionEdit, VersionPtr, LEVELS};
 use crate::{call_on_drop, unregister, LError};
+use std::cmp::Ordering;
+use std::collections::btree_set::BTreeSet;
 
 use bytes::Bytes;
 use crossbeam::channel::unbounded;
 use std::fmt::{Debug, Formatter};
+use std::ops::Bound::{Excluded, Included};
 
 const TARGET_FILE_SIZE: u64 = 2 * 1024 * 1024;
 const MAX_GRANDPARENT_OVERLAP_BYTES: u64 = 10 * TARGET_FILE_SIZE;
@@ -21,7 +24,10 @@ const EXPAND_COMPACTION_BYTE_SIZE_LIMIT: u64 = 25 * TARGET_FILE_SIZE;
 pub struct Compaction<S: Storage> {
     version: VersionPtr<S>,
     level: usize,
+    #[allow(unused)]
+    snapshot_points: Vec<u64>,
     inputs: Vec<Vec<DataFilePtr<S>>>, // at most 3 elements
+    snapshots: BTreeSet<u64>,
 }
 
 impl<S: Storage> Debug for Compaction<S> {
@@ -41,8 +47,10 @@ impl<S: Storage> Compaction<S> {
     ) -> Option<Self> {
         let mut c = Compaction {
             version: version.clone(),
+            snapshot_points: vec![],
             level: 0,
             inputs: vec![vec![], vec![], vec![]],
+            snapshots: BTreeSet::new(),
         };
         if let Some((level, _)) = version
             .compaction
@@ -116,10 +124,10 @@ impl<S: Storage> Compaction<S> {
         true
     }
 
-    fn is_base_level_for_ukey(&self, ucmp: ComparatorImpl, ukey: &[u8]) -> bool {
+    fn is_base_level_for_ukey(&self, icmp: InternalKeyComparator, ikey: &InternalKey) -> bool {
         for level in (self.level + 2)..LEVELS {
             for file in self.version.files_in_level(level) {
-                if file.may_contains(ukey, ucmp) {
+                if file.may_contains(ikey, icmp) {
                     return false;
                 }
             }
@@ -135,6 +143,14 @@ impl<O: Storage, M: MemTable> DB<O, M> {
         }
     }
 
+    pub(crate) fn wait_imem_compaction_finish(&self) {
+        let compactioning = self.compacting_imem.clone();
+        let mut pending = compactioning.0.lock().unwrap();
+        while *pending {
+            pending = compactioning.1.wait(pending).unwrap();
+        }
+    }
+
     pub(crate) fn compact(&self) -> Result<(), LError> {
         let is_mem = self.compact1()?;
         if is_mem {
@@ -144,8 +160,6 @@ impl<O: Storage, M: MemTable> DB<O, M> {
     }
 
     fn compact1(&self) -> Result<bool, LError> {
-        let l = self.compactioning.clone();
-        let _g = l.write()?;
         let inner = self.inner.lock()?;
         if let Some(imem) = inner.imem.as_ref() {
             let imem = imem.clone();
@@ -173,7 +187,7 @@ impl<O: Storage, M: MemTable> DB<O, M> {
             return Ok(true);
         }
         // TODO: support manual compactions
-        let compaction = match Compaction::pick_from_version(
+        let mut compaction = match Compaction::pick_from_version(
             inner.versions.current_version_cloned(),
             self.ucmp,
             self.icmp,
@@ -181,6 +195,7 @@ impl<O: Storage, M: MemTable> DB<O, M> {
             Some(c) => c,
             None => return Ok(false),
         };
+        compaction.snapshots = inner.snapshots.0.clone();
         let total_size = compaction.inputs[2].iter().map(|x| x.size).sum::<u64>();
         // We can simply move the sstable to the next level, since there are no sstables in that level.
         // But we don't do this if the total size of the file in the 'grandparent' level is too large,
@@ -220,10 +235,18 @@ impl<O: Storage, M: MemTable> DB<O, M> {
     }
 
     pub(crate) fn compact_imem_table(&self, imem: &M, log_num: u64) -> Result<(), LError> {
+        let compactioning = self.compacting_imem.clone();
+        *compactioning.0.lock().unwrap() = true;
+        call_on_drop!({
+            *compactioning.0.lock().unwrap() = false;
+            compactioning.1.notify_all();
+        });
+
         let (file_num, mut new_table, mut tmpfile_recycler) = self.new_sstable_file()?;
         let mut scanner = imem.iter(self.ucmp);
         let mut smallest: Option<InternalKey> = None;
         let mut largest: Option<InternalKey> = None;
+
         while let Some((ukey, seq_num, value)) = scanner.next() {
             let (k, v) = match value {
                 None => (InternalKeyKind::Delete, Bytes::new()),
@@ -293,11 +316,10 @@ impl<O: Storage, M: MemTable> DB<O, M> {
         };
         let scanner1: Box<dyn DBScanner> =
             Box::new(ConcatScanner::from(files2scanner(&c.inputs[1])));
-        let scanner = Box::new(MergeScanner::new(
+        let mut scanner = Box::new(MergeScanner::new(
             self.icmp.clone(),
             vec![scanner0, scanner1],
         ));
-        let mut scanner = DedupScanner::new(scanner, self.ucmp);
 
         let mut smallest = None;
         let mut prev_key: Option<InternalKey> = None;
@@ -305,12 +327,24 @@ impl<O: Storage, M: MemTable> DB<O, M> {
         let mut new_files = vec![];
         let mut tmpfile_recyclers = vec![];
         while let Some((ik, v)) = scanner.next()? {
+            if let Some(prev) = prev_key.as_ref() {
+                if self.ucmp.compare(prev.ukey(), ik.ukey()) == Ordering::Equal {
+                    // check if an older version of the same user-key should be kept
+                    let captured = c
+                        .snapshots
+                        .range((Included(ik.seq_num()), Excluded(prev.seq_num())))
+                        .next()
+                        .is_some();
+                    if !captured {
+                        // the older version is not captured by some snapshot. ignore it.
+                        continue;
+                    }
+                }
+            }
             smallest = smallest.or(Some(ik.clone()));
             prev_key = Some(ik.clone());
             // no need to keep the deleted key because there are no older versions of SET operation.
-            if ik.kind() == InternalKeyKind::Delete
-                && c.is_base_level_for_ukey(self.ucmp, ik.ukey())
-            {
+            if ik.kind() == InternalKeyKind::Delete && c.is_base_level_for_ukey(self.icmp, &ik) {
                 continue;
             }
             if new_table.is_none() {
@@ -378,16 +412,17 @@ impl<O: Storage, M: MemTable> DB<O, M> {
 
 #[cfg(test)]
 mod test {
-    use crate::db::{DBScanner, DB};
+    use crate::db::{DBScanner, Snapshot, DB};
     use crate::io::{MemFS, MemFile, Storage, StorageSystem, MEM_FS};
     use crate::key::InternalKeyRef;
     use crate::memtable::simple::BTMap;
     use crate::memtable::MemTable;
-    use crate::opts::OptsRaw;
+    use crate::opts::{OptsRaw, ReadOptions, WriteOptions};
     use crate::sstable::reader::{SSTableReader, SSTableScanner};
     use bytes::Bytes;
     use lazy_static::lazy_static;
     use std::collections::HashMap;
+
     use std::sync::Arc;
 
     #[test]
@@ -401,12 +436,12 @@ mod test {
         let db = DB::open("db_dir".to_string(), opts.clone(), fs).unwrap();
         let mut mem = BTMap::default();
         let mut kvs = HashMap::new();
-        for i in 0..10000 {
+        for i in 1..10000 {
             let uk = format!("key:{}", i);
             let value = format!("value:{}:{}:{}", i, i, i);
             let ik = InternalKeyRef::from((uk.as_ref(), i)).to_owned();
             kvs.insert(ik, value.clone());
-            mem.set(uk.into(), i, value.into());
+            mem.set(uk.into(), i, Some(value.into()));
         }
         let r = db.compact_imem_table(&mem, 1);
         assert!(r.is_ok());
@@ -432,6 +467,7 @@ mod test {
 
     #[test]
     fn test_compact_disk_tables() {
+        let wo = WriteOptions::default();
         let mut opt_raw: OptsRaw = OptsRaw::default();
         opt_raw.write_buffer_size = 128;
         opt_raw.block_size = 512;
@@ -440,22 +476,52 @@ mod test {
         let fs = &*MEM_FS as &'static dyn StorageSystem<O = MemFile>;
         let db: DB<MemFile, BTMap> = DB::open("disk_tables".to_string(), opts.clone(), fs).unwrap();
         let mut kvs = HashMap::new();
-        for i in 0..10000 {
+        for i in 1..10000 {
             let uk = format!("key:{}", i);
             let value = format!("value:{}:{}:{}", i, i, i);
             let ik = InternalKeyRef::from((uk.as_ref(), i)).to_owned();
             kvs.insert(ik, value.clone());
-            assert!(db.set(uk.into(), value.into()).is_ok());
+            assert!(db.set(&wo, uk.into(), value.into()).is_ok());
         }
         let r = db.compact1();
         assert!(r.is_ok());
         for (i, v) in kvs.iter() {
             let vv = Bytes::from(v.clone());
-            if let Ok(Some(vvv)) = db.get(i.ukey()) {
+            if let Ok(Some(vvv)) = db.get(&ReadOptions::default(), i.ukey()) {
                 assert_eq!(vvv.as_ref(), vv.as_ref());
             } else {
                 panic!("not equal");
             }
         }
+    }
+
+    #[test]
+    fn test_compact_wont_delete_keys_in_snapshot() {
+        let wo = WriteOptions::default();
+        let mut opt_raw: OptsRaw = OptsRaw::default();
+        opt_raw.write_buffer_size = 128;
+        opt_raw.block_size = 512;
+        opt_raw.max_file_size = 2048;
+        let opts = Arc::new(opt_raw);
+        let fs = &*MEM_FS as &'static dyn StorageSystem<O = MemFile>;
+        let db: DB<MemFile, BTMap> = DB::open("disk_tables".to_string(), opts.clone(), fs).unwrap();
+        let mut kvs = HashMap::new();
+        let mut snapshot: Option<Snapshot> = None;
+        for i in 1..10000 {
+            let uk = "key";
+            let value = format!("{}", i);
+            let ik = InternalKeyRef::from((uk.as_ref(), i)).to_owned();
+            kvs.insert(ik, value.clone());
+            assert!(db.set(&wo, uk.into(), value.into()).is_ok());
+            if i == 10 {
+                snapshot = Some(db.snapshot());
+            }
+        }
+        assert!(db.compact1().is_ok());
+        let mut ro = ReadOptions::default();
+        ro.set_snapshot(snapshot.unwrap());
+        let r = db.get(&ro, "key".as_ref());
+        assert!(r.is_ok());
+        assert_eq!(r.unwrap(), Some("10".into()));
     }
 }

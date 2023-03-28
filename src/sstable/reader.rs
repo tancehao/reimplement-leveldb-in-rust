@@ -2,14 +2,15 @@ use crate::db::DBScanner;
 use crate::io::{Encoding, Storage};
 use crate::key::InternalKey;
 use crate::opts::Opts;
-use crate::sstable::format::FOOTER_SIZE;
 use crate::sstable::format::{
     read_block_data, read_filter_data, BlockHandle, DataBlock, DataBlockPtr, Filter, Footer,
     IndexBlock,
 };
+use crate::sstable::format::{BlockScanner, FOOTER_SIZE};
 use crate::utils::lru::{CacheSize, LRUCache};
 use crate::LError;
 use bytes::Bytes;
+use std::cmp::Ordering;
 use std::fmt::{Debug, Formatter};
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -21,7 +22,7 @@ pub struct SSTableReader<S: Storage> {
     pub num: u64,
     pub(crate) f: Arc<Mutex<S>>,
     pub(crate) shared_cache: BlockCache,
-    pub(crate) index: IndexBlock,
+    pub(crate) index: Arc<IndexBlock>,
     pub(crate) filter: Option<Filter>,
 }
 
@@ -62,7 +63,7 @@ impl<S: Storage> SSTableReader<S> {
         let filter = read_filter_data(&mut file, filter_meta_index_block, opts)?;
 
         let mut index_block = read_block_data(&mut file, footer.index_handle)?;
-        let index = IndexBlock::decode(&mut index_block, opts)?;
+        let index = Arc::new(IndexBlock::decode(&mut index_block, opts)?);
         Ok(SSTableReader {
             f: Arc::new(Mutex::new(file)),
             shared_cache: LRUCache::new(0),
@@ -105,27 +106,35 @@ impl<S: Storage> SSTableReader<S> {
         Ok(db)
     }
 
-    pub(crate) fn get(&self, ukey: &[u8], opts: &Opts) -> Result<Option<SSTEntry>, LError> {
-        let block_handle = match self.index.search_value(ukey, opts) {
-            Ok((_, bh)) => bh,
-            Err(Some(bh)) => bh,
-            Err(None) => return Ok(None),
-        };
-        if let Some(filter) = self.filter.as_ref() {
-            if !filter.may_contain(block_handle.offset(), ukey) {
-                return Ok(None);
+    pub(crate) fn get(&self, ikey: &InternalKey, opts: &Opts) -> Result<Option<SSTEntry>, LError> {
+        let mut index_scanner = BlockScanner::from(self.index.clone());
+        index_scanner.seek(ikey, opts.get_ucmp());
+        while let Some((ik, block_handle)) = index_scanner.next()? {
+            if opts.get_ucmp().compare(ik.ukey(), ikey.ukey()) == Ordering::Greater {
+                break;
+            }
+            if let Some(filter) = self.filter.as_ref() {
+                if !filter.may_contain(block_handle.offset(), ikey.ukey()) {
+                    continue;
+                }
+            }
+
+            let block = self.load_block(block_handle, opts)?;
+            let mut block_iter = BlockScanner::from(block);
+            block_iter.seek(ikey, opts.get_ucmp());
+            while let Some((ik, val)) = block_iter.next()? {
+                match opts.get_ucmp().compare(ik.ukey(), ikey.ukey()) {
+                    Ordering::Greater => break,
+                    Ordering::Less => continue,
+                    Ordering::Equal => {
+                        if ik.seq_num() <= ikey.seq_num() {
+                            return Ok(Some((ik, val)));
+                        }
+                    }
+                }
             }
         }
-        let r = self
-            .load_block(block_handle, opts)?
-            .search_value(ukey, opts);
-        match r {
-            Ok((key, val)) => {
-                let ik = InternalKey::try_from(key)?;
-                Ok(Some((ik, val)))
-            }
-            _ => Ok(None),
-        }
+        Ok(None)
     }
 }
 

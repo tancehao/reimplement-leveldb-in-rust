@@ -1,15 +1,13 @@
 extern crate core;
 
 use bytes::Bytes;
-use crossbeam::channel::Sender;
 use releveldb::compare::BYTEWISE_COMPARATOR;
 use releveldb::db::{DBScanner, DB};
 use releveldb::io::{OsFS, StorageSystem, OS_FS};
 use releveldb::memtable::simple::BTMap;
-use releveldb::opts::{empty_compact_hook, Opts, OptsRaw};
+use releveldb::opts::{Opts, OptsRaw, ReadOptions, WriteOptions};
 use releveldb::sstable::reader::SSTableReader;
 use releveldb::sstable::reader::SSTableScanner;
-use releveldb::utils::any::Any;
 use releveldb::utils::crc::crc32;
 use releveldb::wal::WalReader;
 use std::collections::HashMap;
@@ -18,7 +16,7 @@ use std::io::{Read, Write};
 use std::sync::Arc;
 
 fn interactive() {
-    let opts = get_opts(Any::new(()));
+    let opts = get_opts();
     let dirname = format!("{}/data", OsFS::default().pwd().unwrap());
     let db: DB<File, BTMap> = DB::open(dirname.clone(), opts.clone(), &OS_FS).unwrap();
     let mut cmd = String::new();
@@ -42,22 +40,26 @@ fn interactive() {
         match cmd_name.as_str() {
             "get" => match params.next() {
                 None => println!("key should be specified."),
-                Some(k) => match db.get(k.as_bytes()) {
-                    Err(e) => println!("Err: {:?}", e),
-                    Ok(Some(v)) => match String::from_utf8(v.to_vec()) {
-                        Ok(vv) => println!("{}", vv),
-                        Err(_) => println!("\"{:?}\"", v),
-                    },
-                    Ok(None) => println!("nil"),
-                },
+                Some(k) => {
+                    let ro = ReadOptions::default();
+                    match db.get(&ro, k.as_bytes()) {
+                        Err(e) => println!("Err: {:?}", e),
+                        Ok(Some(v)) => match String::from_utf8(v.to_vec()) {
+                            Ok(vv) => println!("{}", vv),
+                            Err(_) => println!("\"{:?}\"", v),
+                        },
+                        Ok(None) => println!("nil"),
+                    }
+                }
             },
             "set" => {
                 let (key, value) = (params.next(), params.next());
                 if key.is_none() || value.is_none() {
                     println!("key and value should be specified");
                 } else {
+                    let wo = WriteOptions::default();
                     let (key, value) = (key.unwrap(), value.unwrap());
-                    if let Err(e) = db.set(key.into(), value.into()) {
+                    if let Err(e) = db.set(&wo, key.into(), value.into()) {
                         println!("Err: {:?}", e);
                     }
                 }
@@ -65,7 +67,7 @@ fn interactive() {
             "del" => match params.next() {
                 None => println!("key should be specified."),
                 Some(k) => {
-                    if let Err(e) = db.del(k.into()) {
+                    if let Err(e) = db.del(&WriteOptions::default(), k.into()) {
                         println!("Err: {:?}", e);
                     }
                 }
@@ -82,16 +84,7 @@ fn interactive() {
     }
 }
 
-#[allow(unused)]
-fn log_compaction(data: &Any, key: &[u8], seq_num: u64, value: Option<Bytes>) -> bool {
-    let tx = data
-        .downcast_ref::<Sender<(Vec<u8>, u64, Option<Bytes>)>>()
-        .unwrap();
-    let _ = tx.send((key.to_vec(), seq_num, value));
-    true
-}
-
-fn get_opts(a: Any) -> Opts {
+fn get_opts() -> Opts {
     Arc::new(OptsRaw {
         filter_name: Some("leveldb.BuiltinBloomFilter2".to_string()),
         verify_checksum: false,
@@ -101,12 +94,11 @@ fn get_opts(a: Any) -> Opts {
         compression: true,
         comparer: BYTEWISE_COMPARATOR,
         error_if_db_exists: false,
-        write_buffer_size: 4096000,
+        write_buffer_size: 64 * 1024 * 1024,
         max_file_size: 4 * 1024 * 1024,
-        // compact_hook: (a, log_compaction),
-        compact_hook: (a, empty_compact_hook),
         flush_wal: false,
         tiered_parallel: true,
+        enable_metrics_server: false,
     })
 }
 
@@ -129,7 +121,6 @@ fn main() {
                 Some(v) => v.clone(),
             };
             load(filename);
-            // interactive();
         }
         "test_query" => {
             let filename = match args.get(2) {
@@ -144,7 +135,7 @@ fn main() {
 }
 
 fn learn_sst(name: &str) {
-    let opts = get_opts(Any::new(0));
+    let opts = get_opts();
     let fs = OsFS::default();
     let dirname = format!("{}/data", OsFS::default().pwd().unwrap());
     let full_name = format!("{}/{}", dirname, name);
@@ -181,7 +172,7 @@ fn learn_wal(name: &str) {
 fn load(filename: String) {
     const THREADS: usize = 4;
 
-    let opts = get_opts(Any::new(()));
+    let opts = get_opts();
     let dirname = format!("{}/data", OsFS::default().pwd().unwrap());
     let db: DB<File, BTMap> = DB::open(dirname.clone(), opts.clone(), &OS_FS).unwrap();
     let mut f = File::open(filename).expect("file not found");
@@ -207,10 +198,11 @@ fn load(filename: String) {
         let db_c = db.clone();
         let cmds = cmd_groups.pop().unwrap();
         let j = std::thread::spawn(move || {
+            let wo = WriteOptions::default();
             for (k, v) in cmds {
                 let r = match v {
-                    None => db_c.del(k.into()),
-                    Some(val) => db_c.set(k.into(), val.into()),
+                    None => db_c.del(&wo, k.into()),
+                    Some(val) => db_c.set(&wo, k.into(), val.into()),
                 };
                 if let Err(e) = r {
                     println!("failed to write to db: {:?}", e);
@@ -228,7 +220,7 @@ fn load(filename: String) {
 fn test_query(filename: String) {
     const THREADS: usize = 8;
 
-    let opts = get_opts(Any::new(()));
+    let opts = get_opts();
     let dirname = format!("{}/data", OsFS::default().pwd().unwrap());
     let db: DB<File, BTMap> = DB::open(dirname.clone(), opts.clone(), &OS_FS).unwrap();
     let mut f = File::open(filename).expect("file not found");
@@ -254,15 +246,18 @@ fn test_query(filename: String) {
     let mut threads = vec![];
     for _ in 0..THREADS {
         let db_c = db.clone();
+        let ro = ReadOptions::default();
         let kvs = kvs_groups.pop().unwrap();
         let j = std::thread::spawn(move || {
             for (k, v) in kvs.iter() {
-                let vv = db_c.get(k.as_bytes()).unwrap();
+                let vv = db_c.get(&ro, k.as_bytes()).unwrap();
                 if vv.as_ref() != v.as_ref().map(|x| Bytes::from(x.clone())).as_ref() {
                     println!(
                         "not equal. key: {:?}, expected: {:?}, result: {:?}",
                         k, v, vv
                     );
+                } else {
+                    println!("equal. key: {:?}", k);
                 }
             }
         });

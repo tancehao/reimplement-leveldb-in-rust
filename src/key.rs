@@ -153,7 +153,7 @@ impl Default for InternalKeyKind {
 
 #[derive(Copy, Clone, Debug)]
 pub struct InternalKeyComparator {
-    u: ComparatorImpl,
+    pub(crate) u: ComparatorImpl,
 }
 
 impl Comparator for InternalKeyComparator {
@@ -191,9 +191,8 @@ impl InternalKeyComparator {
         }
     }
 
-    #[allow(unused)]
-    fn name(&self) -> &'static str {
-        "leveldb.InternalKeyComparator"
+    pub(crate) fn ucmp(&self) -> ComparatorImpl {
+        self.u
     }
 }
 

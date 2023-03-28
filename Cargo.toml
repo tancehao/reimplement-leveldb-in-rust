@@ -25,7 +25,5 @@ crossbeam = "0.8.2"
 once_cell = "1.7"
 file-lock = "2.1.6"
 lazy_static = "1.4"
-skiplist = "0.4"
-
-[features]
-async = []
+prometheus = "0.13"
+prometheus_exporter = "0.8"

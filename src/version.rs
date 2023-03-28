@@ -2,7 +2,7 @@ use crate::compare::{Comparator, ComparatorImpl};
 use crate::db::BGWorkTask;
 use crate::filename::{db_filename, set_current_file, FileType};
 use crate::io::{Encoding, Storage, StorageSystem};
-use crate::key::{InternalKey, InternalKeyComparator, InternalKeyRef};
+use crate::key::{InternalKey, InternalKeyComparator};
 use crate::metric::Metric;
 use crate::opts::Opts;
 use crate::sstable::reader::{BlockCache, SSTEntry, SSTableReader};
@@ -54,8 +54,8 @@ impl<O: Storage> VersionSet<O> {
     ) -> Self {
         Self {
             dirname: dirname,
-            ucmp: opts.get_comparator(),
-            icmp: InternalKeyComparator::from(opts.get_comparator()),
+            ucmp: opts.get_ucmp(),
+            icmp: InternalKeyComparator::from(opts.get_ucmp()),
             block_cache: LRUCache::new(opts.get_block_cache_limit()),
             opts: opts,
             version: Arc::new(Version::new(bgevent_trigger.clone())),
@@ -238,7 +238,7 @@ impl<O: Storage> VersionSet<O> {
         let mut manifest_writer = WalWriter::new(manifest_file);
         let mut buf = BytesMut::new();
         let mut ve: VersionEdit<O> = VersionEdit::empty();
-        ve.set_comparator_name(self.opts.get_comparator().name().to_string());
+        ve.set_comparator_name(self.opts.get_ucmp().name().to_string());
         ve.set_next_file_number(MANIFEST_FILE_NUM + 1);
         ve.encode(&mut buf, &self.opts);
         manifest_writer.append(buf.as_ref())?;
@@ -248,7 +248,7 @@ impl<O: Storage> VersionSet<O> {
 }
 
 pub(crate) type DataFilePtr<S> = Arc<DataFile<S>>;
-pub(crate) type AsyncQuery = (Bytes, Sender<Result<Option<SSTEntry>, LError>>, Opts);
+pub(crate) type AsyncQuery = (InternalKey, Sender<Result<Option<SSTEntry>, LError>>, Opts);
 
 #[derive(Clone)]
 pub(crate) struct DataFile<S: Storage> {
@@ -261,27 +261,34 @@ pub(crate) struct DataFile<S: Storage> {
 }
 
 impl<S: Storage> DataFile<S> {
-    pub(crate) fn may_contains(&self, ukey: &[u8], ucmp: ComparatorImpl) -> bool {
-        let r1 = ucmp.compare(ukey, self.smallest.ukey()) == Ordering::Less;
-        let r2 = ucmp.compare(ukey, self.largest.ukey()) == Ordering::Greater;
+    pub(crate) fn may_contains(&self, ikey: &InternalKey, icmp: InternalKeyComparator) -> bool {
+        let r1 = icmp
+            .ucmp()
+            .compare(ikey.ukey(), self.smallest.ukey().as_ref())
+            == Ordering::Less;
+        let r2 = icmp.compare(ikey.as_ref(), self.largest.as_ref()) == Ordering::Greater;
         !(r1 || r2)
     }
 
-    pub(crate) fn search(&self, ukey: &[u8], opts: &Opts) -> Result<Option<SSTEntry>, LError> {
+    pub(crate) fn search(
+        &self,
+        ikey: &InternalKey,
+        opts: &Opts,
+    ) -> Result<Option<SSTEntry>, LError> {
         match self.file.as_ref() {
             None => Err(LError::Internal("db file is not opened".to_string())),
-            Some(f) => f.get(ukey, opts),
+            Some(f) => f.get(ikey, opts),
         }
     }
 
     pub(crate) fn search_parallel(
         &self,
-        key: Bytes,
+        ikey: InternalKey,
         value_tx: Sender<Result<Option<SSTEntry>, LError>>,
         opts: Opts,
     ) -> Result<(), LError> {
         match self.key_stream.as_ref() {
-            Some(s) => s.send((key, value_tx, opts)).map_err(|_| {
+            Some(s) => s.send((ikey, value_tx, opts)).map_err(|_| {
                 LError::Internal(format!("thread for reading sst {} is broken", self.num))
             })?,
             None => {
@@ -295,12 +302,12 @@ impl<S: Storage> DataFile<S> {
 
     pub(crate) fn serve_queries(
         file: Option<SSTableReader<S>>,
-        key_rx: Receiver<(Bytes, Sender<Result<Option<SSTEntry>, LError>>, Opts)>,
+        key_rx: Receiver<(InternalKey, Sender<Result<Option<SSTEntry>, LError>>, Opts)>,
     ) {
-        for (k, value_tx, opts) in key_rx {
+        for (ik, value_tx, opts) in key_rx {
             let res = match file.as_ref() {
                 None => Err(LError::Internal("db file is not opened".to_string())),
-                Some(f) => f.get(k.as_ref(), &opts),
+                Some(f) => f.get(&ik, &opts),
             };
             let _ = value_tx.send(res);
         }
@@ -386,42 +393,39 @@ impl<S: Storage> LevelMode<S> {
 
     pub(crate) fn search_in_level(
         &self,
-        ikey: &InternalKeyRef,
+        ikey: &InternalKey,
         opts: &Opts,
     ) -> Result<Option<SSTEntry>, LError> {
-        let ukey = ikey.ukey;
-
+        let icmp = opts.get_icmp();
         let r = match self {
             LevelMode::Tiered(files) => {
                 if opts.get_tiered_parallel() {
+                    // FIXME optimization possible. We haven't wait for all the background queries.
+                    // Once the one with maximum file_no yields data, we can stop immediately
                     let (value_tx, value_rx) = crossbeam::channel::bounded(files.len());
                     for file in files.iter().rev() {
-                        if file.may_contains(ikey.ukey, opts.get_comparator()) {
-                            file.search_parallel(
-                                ukey.to_vec().into(),
-                                value_tx.clone(),
-                                opts.clone(),
-                            )?;
+                        if file.may_contains(&ikey, icmp) {
+                            file.search_parallel(ikey.clone(), value_tx.clone(), opts.clone())?;
                         }
                     }
                     drop(value_tx);
                     let mut result: Option<(InternalKey, Bytes)> = None;
                     for v in value_rx {
                         if let Some((k, v)) = v? {
-                            match result.as_mut() {
-                                None => result = Some((k, v)),
-                                Some((s, _)) => {
-                                    if k.seq_num() >= s.seq_num() {
-                                        result = Some((k, v));
-                                    }
-                                }
+                            let current_seg_num = result
+                                .as_ref()
+                                .map(|(ik, _)| ik.seq_num())
+                                .unwrap_or_default();
+
+                            if k.seq_num() >= current_seg_num {
+                                result = Some((k, v));
                             }
                         }
                     }
                     result
                 } else {
                     for file in files.iter().rev() {
-                        if let Ok(Some(entry)) = file.search(ukey, opts) {
+                        if let Ok(Some(entry)) = file.search(ikey, opts) {
                             return Ok(Some(entry));
                         }
                     }
@@ -429,20 +433,19 @@ impl<S: Storage> LevelMode<S> {
                 }
             }
             LevelMode::Leveled(files) => {
-                let ucmp = opts.get_comparator();
-                let i = match files.binary_search_by(|x| ucmp.compare(x.largest.ukey(), ukey)) {
+                let i = match files
+                    .binary_search_by(|x| icmp.compare(x.largest.as_ref(), ikey.as_ref()))
+                {
                     Ok(i) => i,
                     Err(i) => {
-                        if i < files.len()
-                            && !(ucmp.compare(files[i].smallest.ukey(), ukey) == Ordering::Greater)
-                        {
+                        if i < files.len() {
                             i
                         } else {
                             return Ok(None);
                         }
                     }
                 };
-                if let Ok(Some(entry)) = files[i].search(ukey, opts) {
+                if let Ok(Some(entry)) = files[i].search(ikey, opts) {
                     return Ok(Some(entry));
                 }
                 None
@@ -635,11 +638,7 @@ impl<S: Storage> Version<S> {
 
 impl<S: Storage> Version<S> {
     // TODO need to collect statistics when querying the db files, in order to help to make decisions on compactions
-    pub(crate) fn get(
-        &self,
-        ikey: InternalKeyRef,
-        opts: &Opts,
-    ) -> Result<Option<SSTEntry>, LError> {
+    pub(crate) fn get(&self, ikey: InternalKey, opts: &Opts) -> Result<Option<SSTEntry>, LError> {
         for files in self.files.iter() {
             if let Some(v) = files.search_in_level(&ikey, opts)? {
                 return Ok(Some(v));

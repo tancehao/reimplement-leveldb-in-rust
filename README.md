@@ -4,7 +4,8 @@ reimplement leveldb in rust, with some new features.
 ## Features
 * Search tired levels(L0 currently) in parellel;
 * Gather writes from multiple threads at the same time into a single wal;
-* User-defined hooks for various events: compaction, data insertion, version changes and etc.
+* Metrics and prometheus exporter;
+* MVCC enabled.
 
 ## Plans
 * Support the async feature: provide the async versions of each interface;
