@@ -39,12 +39,6 @@ impl MemTable for BTMap {
     }
 
     fn get(&self, key: &[u8], snapshot: u64) -> Option<Option<Bytes>> {
-        println!(
-            "getting key: {}, snapshot: {}, my snapshot: {:?}",
-            String::from_utf8(key.to_vec()).unwrap(),
-            snapshot,
-            self.snapshots
-        );
         self.data.get(key).map(|x| {
             x.iter()
                 .rev()
